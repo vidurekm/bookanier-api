@@ -1,0 +1,9 @@
+spring:
+  flyway:
+    enabled: true
+  main:
+    banner-mode: "off"
+logging:
+  level:
+    org.springframework.web: WARN
+    org.springframework.web.servlet.mvc.method.annotation: WARN

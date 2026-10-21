@@ -1,0 +1,46 @@
+name: bookanear
+services:
+  bookanear-api:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_AUTH: "false"
+      SMTP_STARTTLS: "false"
+    depends_on:
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+    restart: unless-stopped
+
+  tests:
+    profiles: ["test"]
+    image: maven:3.9.9-eclipse-temurin-21
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - maven-cache:/root/.m2
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DOCKER_HOST: unix:///var/run/docker.sock
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+      SPRING_PROFILES_ACTIVE: test
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["mvn", "-B", "clean", "verify"]
+
+volumes:
+  maven-cache:
