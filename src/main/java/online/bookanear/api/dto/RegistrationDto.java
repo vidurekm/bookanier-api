@@ -4,6 +4,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 public final class RegistrationDto {
@@ -14,9 +15,14 @@ public final class RegistrationDto {
     public record RegisterRequest(
             @Schema(description = "Display name of the new organization.", example = "Example Studio") @NotBlank String organizationName,
             @Schema(description = "Full name of the organization owner.", example = "Alex Smith") @NotBlank String ownerName,
-            @Schema(description = "Owner email address, used for login and verification.", example = "alex@example.com") @NotBlank @Email String email,
-            @Schema(description = "New account password (12–128 characters).", example = "a-long-strong-password", format = "password", accessMode = Schema.AccessMode.WRITE_ONLY) @NotBlank @Size(min = 12, max = 128) String password
+            @Schema(description = "Owner email address, used for login and verification.", example = "alex@example.com") @NotBlank @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email,
+            @Schema(description = "New account password (8–128 characters).", example = "a-long-strong-password", format = "password", accessMode = Schema.AccessMode.WRITE_ONLY) @NotBlank @Size(min = 8, max = 128) String password,
+            @Schema(description = "Language selected during registration, used for the verification email.", example = "cs")
+            @Pattern(regexp = "cs|sk|pl|en") String language
     ) {
+        public RegisterRequest(String organizationName, String ownerName, String email, String password) {
+            this(organizationName, ownerName, email, password, "cs");
+        }
     }
 
     @Schema(description = "One-time token from the email verification link.")

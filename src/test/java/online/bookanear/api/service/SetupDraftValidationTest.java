@@ -33,18 +33,48 @@ class SetupDraftValidationTest {
     void completeSetupRejectsUnfilledTeamOrService() {
         assertThatThrownBy(() -> service.validate(salon("", ""), true)).isInstanceOf(ApiException.class);
         assertThatThrownBy(() -> service.validate(salon("Anna", ""), true)).isInstanceOf(ApiException.class);
-        assertThatCode(() -> service.validate(salon("Anna", "Stříhání"), true)).doesNotThrowAnyException();
+        var missingEmail = salon("Anna", "Stříhání");
+        assertThatThrownBy(() -> service.validate(missingEmail, true)).isInstanceOf(ApiException.class);
+        var withEmail = withMemberEmail(missingEmail, "anna@example.com");
+        assertThatCode(() -> service.validate(withEmail, true)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void draftsCanOmitWorkerEmailsButCompletionRequiresAValidUniqueEmail() {
+        assertThatCode(() -> service.validate(salon("Anna", "Stříhání"), false)).doesNotThrowAnyException();
+        assertThatThrownBy(() -> service.validate(withMemberEmail(salon("Anna", "Stříhání"), "anna@localhost"), true))
+                .isInstanceOf(ApiException.class);
+        var duplicated = withMemberEmail(salon("Anna", "Stříhání"), "ANNA@example.com");
+        var duplicateMember = new SetupDto.MemberInput("Petr", List.of(0), true, false, false, "anna@example.com");
+        var duplicateEmails = new SetupDto.Draft(duplicated.templateKey(), duplicated.multiLocation(),
+                duplicated.locations(), List.of(duplicated.members().getFirst(), duplicateMember), duplicated.services(),
+                duplicated.trackResources(), duplicated.resourceCount(), duplicated.resourceCapacity(),
+                duplicated.resourceName(), duplicated.customerSelectResource(), duplicated.showStaffChoice(),
+                duplicated.useWaitlist(), duplicated.eventCapacity(), duplicated.workingStart(), duplicated.workingEnd(),
+                duplicated.ownerProvidesServices(), duplicated.ownerLocationIndex(), duplicated.openingHours());
+        assertThatThrownBy(() -> service.validate(duplicateEmails, true)).isInstanceOf(ApiException.class);
+    }
+
+    private static SetupDto.Draft withMemberEmail(SetupDto.Draft draft, String email) {
+        var old = draft.members().getFirst();
+        var member = new SetupDto.MemberInput(old.name(), old.locationIndexes(), old.providesServices(),
+                old.canManageBookings(), old.canApproveOwnAbsence(), email);
+        return new SetupDto.Draft(draft.templateKey(), draft.multiLocation(), draft.locations(),
+                List.of(member), draft.services(), draft.trackResources(), draft.resourceCount(),
+                draft.resourceCapacity(), draft.resourceName(), draft.customerSelectResource(),
+                draft.showStaffChoice(), draft.useWaitlist(), draft.eventCapacity(), draft.workingStart(),
+                draft.workingEnd(), draft.ownerProvidesServices(), draft.ownerLocationIndex(), draft.openingHours());
     }
 
     @Test
     void weeklyOpeningHoursAllowTwoSeparatedIntervalsAndClosedWeekend() {
         var old = salon("Anna", "Stříhání");
-        var ok = new SetupDto.Draft(old.templateKey(), old.multiLocation(), old.locations(),
+        var ok = withMemberEmail(new SetupDto.Draft(old.templateKey(), old.multiLocation(), old.locations(),
                 old.members(), old.services(), old.trackResources(),old.resourceCount(),
                 old.resourceCapacity(),old.resourceName(),old.customerSelectResource(),
                 old.showStaffChoice(),old.useWaitlist(),old.eventCapacity(),old.workingStart(),old.workingEnd(),
                 false,0,List.of(new SetupDto.OpeningIntervalInput(0,1,"09:00","12:00"),
-                        new SetupDto.OpeningIntervalInput(0,1,"13:00","18:00")));
+                        new SetupDto.OpeningIntervalInput(0,1,"13:00","18:00"))), "anna@example.com");
         assertThatCode(() -> service.validate(ok, true)).doesNotThrowAnyException();
         var overlapping = new SetupDto.Draft(ok.templateKey(), ok.multiLocation(), ok.locations(),
                 ok.members(),ok.services(),ok.trackResources(),ok.resourceCount(),ok.resourceCapacity(),

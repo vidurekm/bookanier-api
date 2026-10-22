@@ -98,7 +98,12 @@ public class EventService {
         return result;
     }
     public Object publicEvents(UUID publicId) {
-        var org=one("SELECT o.id,o.booking_enabled,c.booking_model FROM organizations o JOIN organization_booking_config c ON c.organization_id=o.id WHERE o.public_id=:uuid AND o.registration_status='active'",Map.of("uuid",publicId));
+        var org=one("""
+            SELECT o.id,o.booking_enabled,c.booking_model,
+                   COALESCE((c.settings->>'maxAdvanceDays')::integer,180) AS max_advance_days
+            FROM organizations o JOIN organization_booking_config c ON c.organization_id=o.id
+            WHERE o.public_id=:uuid AND o.registration_status='active'
+            """,Map.of("uuid",publicId));
         if(!"EVENT".equals(org.get("booking_model"))) throw new ApiException(HttpStatus.NOT_FOUND,"NOT_FOUND","Not an events organization");
         return db.queryForList("""
             SELECT o.id,o.starts_at,o.ends_at,s.title,s.description,s.price,s.currency,s.location_id,l.name AS location_name,
@@ -109,14 +114,16 @@ public class EventService {
             JOIN locations l ON l.id=s.location_id
             LEFT JOIN event_registrations r ON r.occurrence_id=o.id
             WHERE o.organization_id=:org AND o.status='scheduled' AND o.starts_at>now()
-              AND s.active AND l.active AND :enabled=true
+              AND s.active AND l.active AND l.archived_at IS NULL AND :enabled=true
+              AND o.starts_at<=now()+(CAST(:advanceDays AS integer)*interval '1 day')
             GROUP BY o.id,s.id,l.id ORDER BY o.starts_at LIMIT 200
-            """,Map.of("org",org.get("id"),"enabled",org.get("booking_enabled")));
+            """,Map.of("org",org.get("id"),"enabled",org.get("booking_enabled"),"advanceDays",org.get("max_advance_days")));
     }
     @Transactional
     public Object register(UUID publicId,long occurrence,EventDto.Registration r) {
         var event=one("""
             SELECT o.id,o.organization_id,o.starts_at,o.status,
+                   COALESCE((c.settings->>'maxAdvanceDays')::integer,180) AS max_advance_days,
                    COALESCE(o.capacity_override,s.capacity) AS capacity,s.price,s.currency
             FROM event_occurrences o JOIN event_series s ON s.id=o.series_id
             JOIN organizations org ON org.id=o.organization_id
@@ -127,6 +134,9 @@ public class EventService {
             """,Map.of("uuid",publicId,"id",occurrence));
         if(!"scheduled".equals(event.get("status")) || !((OffsetDateTime)event.get("starts_at")).isAfter(OffsetDateTime.now()))
             throw new ApiException(HttpStatus.CONFLICT,"SLOT_UNAVAILABLE","Event is closed");
+        if(((OffsetDateTime)event.get("starts_at")).isAfter(OffsetDateTime.now().plusDays(
+                ((Number)event.get("max_advance_days")).longValue())))
+            throw new ApiException(HttpStatus.CONFLICT,"SLOT_UNAVAILABLE","Event is too far in advance");
         long org=((Number)event.get("organization_id")).longValue();
         Long taken=db.queryForObject("SELECT COALESCE(sum(seats),0) FROM event_registrations WHERE occurrence_id=:id AND status='confirmed'",Map.of("id",occurrence),Long.class);
         if(taken+r.seats()>((Number)event.get("capacity")).longValue())

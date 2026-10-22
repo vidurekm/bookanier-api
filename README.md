@@ -11,11 +11,15 @@ A runnable **starter backend** for the agreed multi-tenant reservation model. Th
 Prerequisites: Java 21, Maven 3.9+, Docker.
 
 ```bash
-docker compose up -d
+cd bookanear-api
 mvn spring-boot:run
 ```
 
-Flyway is currently disabled in `application.yml`. Apply only pending migrations to your existing database; do not rerun migrations already applied. Health: `GET http://localhost:8080/actuator/health`.
+When running locally, Spring loads the ignored `bookanear-api/.env.local` file. It contains the local configuration defaults and must be updated with valid database and SMTP settings. Docker Compose uses `.env` instead. Flyway applies pending migrations at startup. Health: `GET http://localhost:8080/actuator/health`.
+
+To empty all application tables without removing the schema or Flyway migration history, open `scripts/clean-database.sql` in DBeaver, replace `REPLACE_WITH_DATABASE_NAME` with the exact target database name shown in DBeaver, then execute the script. It refuses to run if the placeholder was not changed or the active connection is to a different database:
+
+This permanently deletes application data and resets table identity sequences. `CASCADE` also clears tables connected by foreign keys. It does not run migrations or remove `flyway_schema_history`.
 
 ## REST API
 
@@ -87,7 +91,11 @@ For real production use, the next milestone is to implement authentication and t
 - Service edit/deactivate: `PUT/DELETE /api/v1/backoffice/organizations/{org}/services/{id}`
 - Service price/duration history: `GET/POST /api/v1/backoffice/organizations/{org}/services/{id}/versions`
 - Location detail/update: `GET/PUT /api/v1/backoffice/organizations/{org}/locations/{id}`
-- Member detail/create/update: `GET/POST/PUT /api/v1/backoffice/organizations/{org}/members[/{id}]`
+- Member detail/update: `GET/PUT /api/v1/backoffice/organizations/{org}/members[/{id}]`
+- Invite a member: owner-only `POST /api/v1/backoffice/organizations/{org}/invitations` with `{email,displayName,role}`; list pending invitations with `GET .../{org}/invitations`.
+- Accept an invitation: `GET /api/v1/invitations?token=...` returns invitation details; `POST /api/v1/invitations/accept` accepts the invite. New invitees provide a password; existing users must authenticate with the same email address.
+- Initial setup collects each team member's email. Completing setup creates the member, preserves its roles, permissions, service/location/schedule assignments, then sends the same invitation linked to that member record. Draft saves may omit the email; completion requires a valid, unique address.
+- Invitation tokens are 32 random bytes, stored only as SHA-256 hashes, single-use, and expire after 24 hours. Invitation email uses the existing SMTP sender and `${REGISTRATION_HOME_URL}` frontend base URL.
 - Member services: `GET /members/{id}/services`, `PUT /members/{id}/services/{serviceId}` (under backoffice org prefix)
 - Customer detail/update: `GET/PUT /api/v1/backoffice/organizations/{org}/customers/{id}`
 - Reservation detail with items: `GET /api/v1/backoffice/organizations/{org}/reservations/{id}`
@@ -95,7 +103,7 @@ For real production use, the next milestone is to implement authentication and t
 - Add member schedule: `POST /api/v1/backoffice/organizations/{org}/schedule`
 - Absences: `GET/POST /api/v1/backoffice/organizations/{org}/absences`
 
-**SECURITY WARNING:** Backoffice endpoints currently have no authentication/authorization. Do not expose to the public internet until Spring Security and tenant-scoped authorization are implemented. Swagger is also open.
+Backoffice endpoints use bearer authentication and tenant-scoped role authorization. Swagger remains publicly accessible.
 
 Service versions use non-overlapping PostgreSQL `daterange` periods; to change an existing open-ended version, close it first in a controlled migration/workflow before inserting the new version. Existing booking snapshots must not be rewritten.
 
@@ -103,13 +111,13 @@ Service versions use non-overlapping PostgreSQL `daterange` periods; to change a
 
 Flyway migration: `V2__organization_registration.sql` (apply **after** V1, do not edit V1).
 
-- `POST /api/v1/registration` with `organizationName`, `slug`, `ownerName`, `email`, `password`.
+- `POST /api/v1/registration` with `organizationName`, `ownerName`, `email`, `password` and optional `language` (`cs`, `sk`, `pl` or `en`).
 - `POST /api/v1/registration/verify` with `{"token":"..."}`.
-- Email URL: `${REGISTRATION_PUBLIC_URL}/verify-email?token=...`. The **frontend must implement this page**, extract the token and POST it to `/api/v1/registration/verify` after user confirmation. GET does not consume the token (avoids email-link-scanner activations).
+- The verification email is localized to the language selected on the registration form. Its one-time link opens the matching localized frontend page.
 - Token is 32 random bytes, URL-safe, SHA-256 hashed in DB, one-time, expires after 24h.
 - Password stored as BCrypt hash. Duplicate email or slug yields HTTP 409 via existing handler.
-- SMTP env: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_AUTH`, `SMTP_STARTTLS`, `REGISTRATION_FROM_EMAIL`, `REGISTRATION_PUBLIC_URL`.
-- For local SMTP testing use Mailpit or another development SMTP server on port 1025.
+- Local configuration, including SMTP defaults, is in the ignored `.env.local` file. Do not commit real credentials.
+- For local SMTP testing, Mailpit's web interface is available at `http://127.0.0.1:18082` and its host SMTP port is `11025` (the container SMTP port remains `1025`).
 - Previous unauthenticated `POST /api/v1/organizations` was removed to prevent bypassing verification.
 
 ### Example

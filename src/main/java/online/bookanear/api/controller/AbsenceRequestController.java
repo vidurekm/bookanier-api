@@ -16,6 +16,9 @@ public class AbsenceRequestController {
     @GetMapping @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
     public Object list(@PathVariable long org, Authentication auth) { return service.list(org,auth); }
 
+    @GetMapping("/locations") @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
+    public Object locations(@PathVariable long org, Authentication auth) { return service.locations(org,auth); }
+
     @PostMapping @ResponseStatus(HttpStatus.CREATED)
     @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
     public Object request(@PathVariable long org,@Valid @RequestBody AbsenceRequestService.CreateRequest data,

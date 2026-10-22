@@ -33,6 +33,7 @@ public class MediaService {
 
     public enum Kind {
         ORGANIZATION("organization", "organization_images", "organization_id", "organizations"),
+        ORGANIZATION_LOGO("organization-logo", "organization_logos", "organization_id", "organizations"),
         LOCATION("location", "location_images", "location_id", "locations"),
         SERVICE("service", "service_images", "service_id", "services"),
         RESOURCE("resource", "resource_images", "resource_id", "resources"),
@@ -88,6 +89,12 @@ public class MediaService {
         var asset = asset(org, mediaId);
         Map<String, Object> args = Map.of("org", org, "target", targetId, "media", mediaId,
                 "sort", request.sortOrder(), "primary", request.primary());
+        if (kind == Kind.ORGANIZATION_LOGO) {
+            db.update("DELETE FROM organization_logos WHERE organization_id=:org", args);
+            db.update("INSERT INTO organization_logos (organization_id,media_id) VALUES (:org,:media)", args);
+            return new MediaDto.ImageInfo(mediaId, publicUrl(mediaId), (String) asset.get("content_type"),
+                    ((Number) asset.get("width")).intValue(), ((Number) asset.get("height")).intValue(), 0, true);
+        }
         if (request.primary()) {
             db.update("UPDATE " + kind.table + " SET is_primary=false WHERE organization_id=:org AND " +
                     kind.column + "=:target AND is_primary=true", args);
@@ -109,9 +116,26 @@ public class MediaService {
     public void detach(long org, Kind kind, long targetId, long mediaId) {
         lockTarget(org, kind, targetId);
         Map<String, Object> args = Map.of("org", org, "target", targetId, "media", mediaId);
+        if (kind == Kind.ORGANIZATION_LOGO) {
+            int removed = db.update("DELETE FROM organization_logos WHERE organization_id=:org AND media_id=:media", args);
+            if (removed == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Image assignment not found");
+            return;
+        }
         int n = db.update("DELETE FROM " + kind.table + " WHERE organization_id=:org AND " +
                 kind.column + "=:target AND media_id=:media", args);
         if (n == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Image assignment not found");
+        if (kind == Kind.ORGANIZATION) {
+            db.update("""
+                    UPDATE organization_images SET is_primary=true
+                    WHERE organization_id=:org AND media_id=(
+                        SELECT media_id FROM organization_images
+                        WHERE organization_id=:org ORDER BY sort_order,media_id LIMIT 1
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM organization_images
+                        WHERE organization_id=:org AND is_primary=true
+                    )
+                    """, args);
+        }
     }
 
     public List<MediaDto.ImageInfo> list(long org, Kind kind, long targetId, boolean publicOnly) {
@@ -120,6 +144,16 @@ public class MediaService {
             if (active == null || active == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Organization not found");
         }
         ensureTarget(org, kind, targetId);
+        if (kind == Kind.ORGANIZATION_LOGO) {
+            return db.query("""
+                    SELECT a.id,a.content_type,a.width,a.height
+                    FROM organization_logos i
+                    JOIN media_assets a ON a.organization_id=i.organization_id AND a.id=i.media_id
+                    WHERE i.organization_id=:org
+                    """, Map.of("org", org), (rs, row) ->
+                    new MediaDto.ImageInfo(rs.getLong("id"), publicUrl(rs.getLong("id")),
+                            rs.getString("content_type"), rs.getInt("width"), rs.getInt("height"), 0, true));
+        }
         String sql = "SELECT a.id,a.content_type,a.width,a.height,i.sort_order,i.is_primary FROM " + kind.table +
                 " i JOIN media_assets a ON a.organization_id=i.organization_id AND a.id=i.media_id " +
                 "WHERE i.organization_id=:org AND i." + kind.column + "=:target ORDER BY i.is_primary DESC,i.sort_order,a.id";
@@ -174,9 +208,9 @@ public class MediaService {
     }
 
     private void ensureTarget(long org, Kind kind, long id) {
-        if (kind == Kind.ORGANIZATION && id != org) throw new ApiException(HttpStatus.NOT_FOUND, "Organization not found");
+        if ((kind == Kind.ORGANIZATION || kind == Kind.ORGANIZATION_LOGO) && id != org) throw new ApiException(HttpStatus.NOT_FOUND, "Organization not found");
         Integer found = db.queryForObject("SELECT count(*) FROM " + kind.entityTable +
-                " WHERE " + (kind == Kind.ORGANIZATION ? "id=:target" : "organization_id=:org AND id=:target"),
+                " WHERE " +                 (kind == Kind.ORGANIZATION || kind == Kind.ORGANIZATION_LOGO ? "id=:target" : "organization_id=:org AND id=:target"),
                 Map.of("org", org, "target", id), Integer.class);
         if (found == null || found == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Image target not found");
     }
@@ -184,7 +218,7 @@ public class MediaService {
     private void lockTarget(long org, Kind kind, long id) {
         ensureTarget(org, kind, id);
         db.queryForList("SELECT id FROM " + kind.entityTable + " WHERE " +
-                (kind == Kind.ORGANIZATION ? "id=:target" : "organization_id=:org AND id=:target") + " FOR UPDATE",
+                (kind == Kind.ORGANIZATION || kind == Kind.ORGANIZATION_LOGO ? "id=:target" : "organization_id=:org AND id=:target") + " FOR UPDATE",
                 Map.of("org", org, "target", id));
     }
 

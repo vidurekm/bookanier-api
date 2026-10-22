@@ -50,8 +50,24 @@ public class BackofficeService {
     }
 
     @Transactional
-    public void deactivateService(long org, long id) {
-        if (db.update("update services set active=false where organization_id=:org and id=:id", p(org, id)) == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Service not found");
+    public void deleteService(long org, long id) {
+        var service = db.queryForList(
+                "SELECT id FROM services WHERE organization_id=:org AND id=:id FOR UPDATE", p(org, id));
+        if (service.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Service not found");
+        boolean used = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM reservation_items WHERE organization_id=:org AND service_id=:id)
+                    OR EXISTS(SELECT 1 FROM waitlist_entries WHERE organization_id=:org AND service_id=:id)
+                """, p(org, id), Boolean.class));
+        if (used) throw new ApiException(HttpStatus.CONFLICT, "SERVICE_IN_USE",
+                "A service used by reservations or waitlist entries cannot be deleted");
+
+        db.update("DELETE FROM service_images WHERE organization_id=:org AND service_id=:id", p(org, id));
+        db.update("DELETE FROM service_resource_requirements WHERE service_id=:id", p(org, id));
+        db.update("DELETE FROM worker_services WHERE organization_id=:org AND service_id=:id", p(org, id));
+        db.update("DELETE FROM location_services WHERE organization_id=:org AND service_id=:id", p(org, id));
+        db.update("DELETE FROM service_versions WHERE service_id=:id", p(org, id));
+        if (db.update("DELETE FROM services WHERE organization_id=:org AND id=:id", p(org, id)) == 0)
+            throw new ApiException(HttpStatus.NOT_FOUND, "Service not found");
     }
 
     public Object versions(long org, long id) {
@@ -205,7 +221,42 @@ public class BackofficeService {
     public Object updateLocation(long org, long id, BackofficeDto.LocationUpsert r) {
         checkCoordinates(r.latitude(), r.longitude());
         var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.name()).addValue("address", r.address()).addValue("tz", r.timezone()).addValue("active", r.active()).addValue("latitude", r.latitude()).addValue("longitude", r.longitude());
-        return one("update locations set name=:name,address=:address,timezone=:tz,active=:active,latitude=:latitude,longitude=:longitude where organization_id=:org and id=:id returning *", a.getValues());
+        return one("update locations set name=:name,address=:address,timezone=:tz,active=:active,latitude=:latitude,longitude=:longitude where organization_id=:org and id=:id and archived_at is null returning *", a.getValues());
+    }
+
+    @Transactional
+    public void archiveLocation(long org, long id) {
+        lockScheduleOrganization(org);
+        if (db.queryForList("""
+                SELECT id FROM locations
+                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                FOR UPDATE
+                """, Map.of("org", org, "id", id)).isEmpty())
+            throw new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", "Location not found");
+        boolean hasFutureReservations = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM reservation_items ri
+                    JOIN reservations r ON r.id=ri.reservation_id AND r.organization_id=ri.organization_id
+                    WHERE ri.organization_id=:org AND ri.location_id=:id
+                      AND ri.item_status='active' AND r.status IN ('confirmed','pending')
+                      AND ri.starts_at>now()
+                ) OR EXISTS (
+                    SELECT 1
+                    FROM event_occurrences eo
+                    JOIN event_series es ON es.id=eo.series_id AND es.organization_id=eo.organization_id
+                    JOIN event_registrations er ON er.occurrence_id=eo.id AND er.organization_id=eo.organization_id
+                    WHERE eo.organization_id=:org AND es.location_id=:id
+                      AND eo.status='scheduled' AND eo.starts_at>now() AND er.status='confirmed'
+                )
+                """, Map.of("org", org, "id", id), Boolean.class));
+        if (hasFutureReservations)
+            throw new ApiException(HttpStatus.CONFLICT, "LOCATION_HAS_ACTIVE_RESERVATIONS",
+                    "Cancel future reservations and event registrations before archiving this location");
+        db.update("""
+                UPDATE locations SET active=false,archived_at=now()
+                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                """, Map.of("org", org, "id", id));
     }
 
     public Object member(long org, long id) {
@@ -213,15 +264,41 @@ public class BackofficeService {
     }
 
     @Transactional
-    public Object createMember(long org, BackofficeDto.MemberUpsert r) {
-        var a = new MapSqlParameterSource().addValue("org", org).addValue("name", r.displayName()).addValue("role", r.role() == null ? "worker" : r.role()).addValue("active", r.active()).addValue("manage",r.canManageBookings()).addValue("approve",r.canApproveOwnAbsence());
-        return one("insert into organization_members(organization_id,display_name,role,active,can_manage_bookings,can_approve_own_absence) values(:org,:name,:role,:active,COALESCE(CAST(:manage AS boolean),false),COALESCE(CAST(:approve AS boolean),false)) returning *", a.getValues());
+    public Object updateMember(long org, long id, BackofficeDto.MemberUpsert r) {
+        var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.displayName()).addValue("role", r.role() == null ? "worker" : r.role()).addValue("active", r.active()).addValue("manage",r.canManageBookings()).addValue("approve",r.canApproveOwnAbsence());
+        return one("update organization_members set display_name=:name,role=:role,active=:active,can_manage_bookings=COALESCE(CAST(:manage AS boolean),can_manage_bookings),can_approve_own_absence=COALESCE(CAST(:approve AS boolean),can_approve_own_absence) where organization_id=:org and id=:id and archived_at is null returning *", a.getValues());
     }
 
     @Transactional
-    public Object updateMember(long org, long id, BackofficeDto.MemberUpsert r) {
-        var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.displayName()).addValue("role", r.role() == null ? "worker" : r.role()).addValue("active", r.active()).addValue("manage",r.canManageBookings()).addValue("approve",r.canApproveOwnAbsence());
-        return one("update organization_members set display_name=:name,role=:role,active=:active,can_manage_bookings=COALESCE(CAST(:manage AS boolean),can_manage_bookings),can_approve_own_absence=COALESCE(CAST(:approve AS boolean),can_approve_own_absence) where organization_id=:org and id=:id returning *", a.getValues());
+    public void archiveMember(long org, long id) {
+        lockScheduleOrganization(org);
+        var rows = db.queryForList("""
+                SELECT role FROM organization_members
+                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                FOR UPDATE
+                """, Map.of("org", org, "id", id));
+        if (rows.isEmpty())
+            throw new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", "Member not found");
+        if (!"worker".equals(rows.getFirst().get("role")))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Only workers can be removed from the team");
+        boolean hasFutureReservations = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM reservation_items ri
+                    JOIN reservations r ON r.id=ri.reservation_id AND r.organization_id=ri.organization_id
+                    WHERE ri.organization_id=:org AND ri.member_id=:id
+                      AND ri.item_status='active' AND r.status IN ('confirmed','pending')
+                      AND ri.starts_at>now()
+                )
+                """, Map.of("org", org, "id", id), Boolean.class));
+        if (hasFutureReservations)
+            throw new ApiException(HttpStatus.CONFLICT, "MEMBER_HAS_ACTIVE_RESERVATIONS",
+                    "Cancel or reassign future reservations before removing this worker");
+        db.update("""
+                UPDATE organization_members
+                SET active=false,archived_at=now()
+                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                """, Map.of("org", org, "id", id));
     }
 
     public Object memberServices(long org, long id) {
@@ -245,6 +322,28 @@ public class BackofficeService {
     public Object updateCustomer(long org, long id, BackofficeDto.CustomerUpsert r) {
         var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.name()).addValue("email", r.email()).addValue("phone", r.phone()).addValue("notes", r.notes());
         return one("update customers set name=:name,email=:email,phone=:phone,notes=:notes where organization_id=:org and id=:id returning *", a.getValues());
+    }
+
+    @Transactional
+    public void deleteCustomer(long org, long id) {
+        if (db.queryForList("""
+                SELECT id FROM customers
+                WHERE organization_id=:org AND id=:id
+                FOR UPDATE
+                """, p(org, id)).isEmpty())
+            throw new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", "Customer not found");
+
+        db.update("""
+                UPDATE reservations SET customer_id=NULL
+                WHERE organization_id=:org AND customer_id=:id
+                """, p(org, id));
+        db.update("""
+                UPDATE waitlist_entries
+                SET customer_id=NULL,
+                    status=CASE WHEN status IN ('waiting','offered') THEN 'cancelled' ELSE status END
+                WHERE organization_id=:org AND customer_id=:id
+                """, p(org, id));
+        db.update("DELETE FROM customers WHERE organization_id=:org AND id=:id", p(org, id));
     }
 
     public Object reservation(long org, long id, Authentication authentication) {
@@ -711,16 +810,16 @@ public class BackofficeService {
                 + " AND (CAST(:email AS text) IS NULL OR c.email ILIKE :email ESCAPE '\\') ";
         where += " AND (CAST(:q AS text) IS NULL OR c.name ILIKE :q ESCAPE '\\' OR c.email ILIKE :q ESCAPE '\\' OR c.phone ILIKE :q ESCAPE '\\') ";
         String order = sortOrder(sort, Map.of("id", "c.id", "name", "c.name", "email", "c.email", "phone", "c.phone"), "c.id");
-        return paged("SELECT c.id,c.name,c.email,c.phone", where, order, params, page, size);
+        return paged("SELECT c.id,c.name,c.email,c.phone,c.notes", where, order, params, page, size);
     }
 
     @Transactional
     public Object createCustomer(long org, BackofficeDto.CreateCustomer r) {
         var a = new MapSqlParameterSource().addValue("org", org).addValue("name", r.name())
-                .addValue("email", r.email()).addValue("phone", r.phone());
+                .addValue("email", r.email()).addValue("phone", r.phone()).addValue("notes", r.notes());
         return one("""
-                INSERT INTO customers(organization_id,name,email,phone)
-                VALUES(:org,:name,:email,:phone) RETURNING id,name,email
+                INSERT INTO customers(organization_id,name,email,phone,notes)
+                VALUES(:org,:name,:email,:phone,:notes) RETURNING id,name,email,notes
                 """, a.getValues());
     }
 
@@ -757,11 +856,11 @@ public class BackofficeService {
             throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid role");
         var params = pageParams(page, size).addValue("org", org)
                 .addValue("name", contains(name)).addValue("role", blankToNull(role)).addValue("q", contains(q));
-        String where = " FROM organization_members m WHERE m.organization_id=:org "
+        String where = " FROM organization_members m LEFT JOIN users u ON u.id=m.user_id WHERE m.organization_id=:org AND m.archived_at IS NULL "
                 + " AND (CAST(:name AS text) IS NULL OR m.display_name ILIKE :name ESCAPE '\\') "
                 + " AND (CAST(:role AS text) IS NULL OR m.role=:role) ";
-        where += " AND (CAST(:q AS text) IS NULL OR m.display_name ILIKE :q ESCAPE '\\' OR m.role ILIKE :q ESCAPE '\\') ";
-        return paged("SELECT m.id,m.user_id,m.display_name,m.role,m.active,m.can_manage_bookings,m.can_approve_own_absence", where,
+        where += " AND (CAST(:q AS text) IS NULL OR m.display_name ILIKE :q ESCAPE '\\' OR m.role ILIKE :q ESCAPE '\\' OR u.email ILIKE :q ESCAPE '\\') ";
+        return paged("SELECT m.id,m.user_id,u.email,m.display_name,m.role,m.active,m.can_manage_bookings,m.can_approve_own_absence", where,
                 sortOrder(sort, Map.of("id", "m.id", "name", "m.display_name", "role", "m.role", "active", "m.active"), "m.id"), params, page, size);
     }
 
@@ -779,7 +878,7 @@ public class BackofficeService {
     public Object locations(long org, String name, Boolean active, int page, int size, String q, String sort) {
         var params = pageParams(page, size).addValue("org", org)
                 .addValue("name", contains(name)).addValue("active", active).addValue("q", contains(q));
-        String where = " FROM locations l WHERE l.organization_id=:org "
+        String where = " FROM locations l WHERE l.organization_id=:org AND l.archived_at IS NULL "
                 + " AND (CAST(:name AS text) IS NULL OR l.name ILIKE :name ESCAPE '\\') "
                 + " AND (CAST(:active AS boolean) IS NULL OR l.active=:active) ";
         where += " AND (CAST(:q AS text) IS NULL OR l.name ILIKE :q ESCAPE '\\' OR l.address ILIKE :q ESCAPE '\\' OR l.timezone ILIKE :q ESCAPE '\\') ";
@@ -879,8 +978,13 @@ public class BackofficeService {
                 .addValue("createdTo", createdTo);
 
         boolean superadmin = organizationSecurity.isSuperadmin(authentication);
-        String fromWhere = superadmin ? " FROM organizations o WHERE true " : """
+        String fromWhere = superadmin ? """
                 FROM organizations o
+                LEFT JOIN organization_booking_config c ON c.organization_id = o.id
+                WHERE true
+                """ : """
+                FROM organizations o
+                LEFT JOIN organization_booking_config c ON c.organization_id = o.id
                 WHERE EXISTS (
                     SELECT 1 FROM organization_members m
                     JOIN users u ON u.id = m.user_id
@@ -909,10 +1013,11 @@ public class BackofficeService {
                 SELECT o.id, o.public_id, o.name, o.email, o.phone,
                        o.default_timezone, o.booking_enabled,
                        o.registration_status, o.created_at,
+                       c.setup_status,
                        (SELECT m.role FROM organization_members m
-                        WHERE m.organization_id = o.id AND m.user_id = :userId AND m.active = true
-                        ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
-                        LIMIT 1) AS my_role
+                       WHERE m.organization_id = o.id AND m.user_id = :userId AND m.active = true
+                       ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+                       LIMIT 1) AS my_role
                 """, fromWhere, order, params, page, size);
     }
 }

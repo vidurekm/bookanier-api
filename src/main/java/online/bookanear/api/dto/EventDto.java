@@ -11,6 +11,6 @@ public final class EventDto {
                          @Pattern(regexp="[A-Z]{3}") String currency) {}
     public record Occurrence(@NotNull OffsetDateTime startsAt, @NotNull OffsetDateTime endsAt,
                              @Min(1) @Max(10000) Integer capacityOverride) {}
-    public record Registration(@NotBlank String customerName, @NotBlank @Email String customerEmail,
+    public record Registration(@NotBlank String customerName, @NotBlank @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String customerEmail,
                                String customerPhone, @Min(1) @Max(100) int seats) {}
 }

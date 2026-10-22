@@ -61,6 +61,19 @@ class PasswordResetControllerIT extends PostgresIntegrationTest {
         verifyNoInteractions(mailSender);
     }
     @Test
+    void resetEmailUsesTheLanguageSelectedOnTheRequest() throws Exception {
+        user(true);
+        mvc.perform(post(PASSWORD+"/forgot").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"worker@example.test\",\"language\":\"en\"}"))
+                .andExpect(status().isAccepted());
+        var captor = ArgumentCaptor.forClass(SimpleMailMessage.class);
+        verify(mailSender).send(captor.capture());
+        var message = captor.getValue();
+        assertThat(message.getSubject()).isEqualTo("Bookanear password reset");
+        assertThat(message.getText()).contains("A password change was requested",
+                "http://localhost:5173/en/reset-password?token=", "valid for 30 minutes");
+    }
+    @Test
     void verifiedUserCanResetOnceAndOldJwtBecomesInvalid() throws Exception {
         long user = user(true);
         String jwtJson = mvc.perform(post("/api/v1/auth/login").contentType(MediaType.APPLICATION_JSON)
@@ -91,6 +104,26 @@ class PasswordResetControllerIT extends PostgresIntegrationTest {
         mvc.perform(post("/api/v1/auth/login").contentType(MediaType.APPLICATION_JSON)
                 .content("{\"email\":\"worker@example.test\",\"password\":\"new-secret-password\"}"))
                 .andExpect(status().isOk());
+    }
+    @Test
+    void forgotPasswordRejectsEmailWithoutDottedDomain() throws Exception {
+        mvc.perform(post(PASSWORD+"/forgot").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"email\":\"df@s\"}"))
+                .andExpect(status().isBadRequest());
+        verifyNoInteractions(mailSender);
+    }
+    @Test
+    void resetPasswordAllowsEightButNotSevenCharacters() throws Exception {
+        long id = user(true);
+        String token = requestReset();
+        mvc.perform(post(PASSWORD+"/reset").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"token\":\""+token+"\",\"newPassword\":\"1234567\"}"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(post(PASSWORD+"/reset").contentType(MediaType.APPLICATION_JSON)
+                .content("{\"token\":\""+token+"\",\"newPassword\":\"12345678\"}"))
+                .andExpect(status().isOk());
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM password_reset_tokens WHERE user_id=:id AND used_at IS NOT NULL",
+                Map.of("id", id), Integer.class)).isEqualTo(1);
     }
     @Test
     void unverifiedAccountCannotRequestPasswordReset() throws Exception {

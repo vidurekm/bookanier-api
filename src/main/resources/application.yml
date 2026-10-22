@@ -1,37 +1,40 @@
 spring:
+  config:
+    import: optional:file:.env.local[.properties]
   application:
-    name: bookanear-api
+    name: ${SPRING_APPLICATION_NAME:bookanear-api}
   datasource:
     url: ${DB_URL}
     username: ${DB_USER}
     password: ${DB_PASSWORD}
   flyway:
-    enabled: true
-    baseline-on-migrate: false
-    baseline-version: 6
-    validate-on-migrate: true
+    enabled: ${FLYWAY_ENABLED:true}
+    baseline-on-migrate: ${FLYWAY_BASELINE_ON_MIGRATE:false}
+    baseline-version: ${FLYWAY_BASELINE_VERSION:6}
+    validate-on-migrate: ${FLYWAY_VALIDATE_ON_MIGRATE:true}
   servlet:
     multipart:
-      max-file-size: 10MB
-      max-request-size: 11MB
+      max-file-size: ${MAX_FILE_SIZE:10MB}
+      max-request-size: ${MAX_REQUEST_SIZE:11MB}
   jackson:
-    time-zone: UTC
+    time-zone: ${JACKSON_TIME_ZONE:UTC}
   mail:
-    host: ${SMTP_HOST}
-    port: ${SMTP_PORT}
-    username: ${SMTP_USERNAME}
-    password: ${SMTP_PASSWORD}
+    host: ${SMTP_HOST:localhost}
+    port: ${SMTP_PORT:1025}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
     properties:
       mail.smtp.auth: ${SMTP_AUTH:false}
       mail.smtp.starttls.enable: ${SMTP_STARTTLS:false}
 server:
+  port: ${SERVER_PORT:8080}
   error:
-    include-message: always
+    include-message: ${SERVER_ERROR_INCLUDE_MESSAGE:always}
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,info}
 app:
   public-base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
   geocoding:
@@ -45,32 +48,32 @@ app:
     region: ${MEDIA_S3_REGION:auto}
     access-key: ${MEDIA_S3_ACCESS_KEY:}
     secret-key: ${MEDIA_S3_SECRET_KEY:}
-    max-file-bytes: 10485760
+    max-file-bytes: ${MEDIA_MAX_FILE_BYTES:10485760}
   security:
     jwt:
       secret: ${JWT_SECRET}
       issuer: ${JWT_ISSUER:bookanear-api}
-      expiration-minutes: 10080
+      expiration-minutes: ${JWT_EXPIRATION_MINUTES:10080}
     password-reset:
       minutes: ${PASSWORD_RESET_MINUTES:30}
 
 springdoc:
   swagger-ui:
-    path: /swagger-ui.html
-    tags-sorter: alpha
-    operations-sorter: alpha
+    path: ${SWAGGER_UI_PATH:/swagger-ui.html}
+    tags-sorter: ${SWAGGER_TAGS_SORTER:alpha}
+    operations-sorter: ${SWAGGER_OPERATIONS_SORTER:alpha}
   api-docs:
-    path: /v3/api-docs
+    path: ${OPENAPI_DOCS_PATH:/v3/api-docs}
 
 registration:
   home-url: ${REGISTRATION_HOME_URL:http://localhost:5173/}
   from-email: ${REGISTRATION_FROM_EMAIL:no-reply@example.test}
-  token-hours: 24
+  token-hours: ${REGISTRATION_TOKEN_HOURS:24}
 
 logging:
   level:
-    org.springframework.web: DEBUG
-    org.springframework.web.servlet.mvc.method.annotation: DEBUG
-    com.zaxxer.hikari: DEBUG
-    org.springframework.jdbc: DEBUG
-    org.springframework.transaction: DEBUG
+    org.springframework.web: ${LOG_LEVEL_SPRING_WEB:DEBUG}
+    org.springframework.web.servlet.mvc.method.annotation: ${LOG_LEVEL_SPRING_MVC:DEBUG}
+    com.zaxxer.hikari: ${LOG_LEVEL_HIKARI:DEBUG}
+    org.springframework.jdbc: ${LOG_LEVEL_JDBC:DEBUG}
+    org.springframework.transaction: ${LOG_LEVEL_TRANSACTION:DEBUG}

@@ -16,4 +16,10 @@ public final class FrontendLinks {
     public static String localized(String base, String path) {
         return base + (base.matches(".*/(cs|sk|pl|en)$") ? "" : "/cs") + path;
     }
+
+    public static String localized(String base, String language, String path) {
+        String normalizedBase = base.replaceFirst("/(cs|sk|pl|en)$", "");
+        String locale = java.util.Set.of("cs", "sk", "pl", "en").contains(language) ? language : "cs";
+        return normalizedBase + "/" + locale + path;
+    }
 }

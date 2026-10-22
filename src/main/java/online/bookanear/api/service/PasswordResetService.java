@@ -30,6 +30,7 @@ import java.util.Map;
 @Service
 public class PasswordResetService {
     private static final Logger log = LoggerFactory.getLogger(PasswordResetService.class);
+    private record ResetEmail(String subject, String text) {}
     private final NamedParameterJdbcTemplate db;
     private final JavaMailSender mailSender;
     private final SecureRandom secureRandom = new SecureRandom();
@@ -56,10 +57,40 @@ public class PasswordResetService {
         catch (NoSuchAlgorithmException ex) { throw new IllegalStateException(ex); }
     }
 
+    private static ResetEmail resetEmail(String language, String link, long tokenMinutes) {
+        return switch (language) {
+            case "sk" -> new ResetEmail("Obnovenie hesla k účtu Bookanear",
+                    "Požiadali ste o zmenu hesla k účtu Bookanear.\n\n"
+                    + "Nastavte si nové heslo pomocou tohto odkazu:\n"
+                    + link + "\n\n"
+                    + "Odkaz je platný " + tokenMinutes + " minút a možno ho použiť iba raz."
+                    + "\nAk ste o zmenu nežiadali, túto správu ignorujte.");
+            case "pl" -> new ResetEmail("Resetowanie hasła do konta Bookanear",
+                    "Poproszono o zmianę hasła do konta Bookanear.\n\n"
+                    + "Ustaw nowe hasło za pomocą tego linku:\n"
+                    + link + "\n\n"
+                    + "Link jest ważny przez " + tokenMinutes + " minut i można go użyć tylko raz."
+                    + "\nJeśli nie prosisz o zmianę hasła, zignoruj tę wiadomość.");
+            case "en" -> new ResetEmail("Bookanear password reset",
+                    "A password change was requested for your Bookanear account.\n\n"
+                    + "Set a new password using this link:\n"
+                    + link + "\n\n"
+                    + "This link is valid for " + tokenMinutes + " minutes and can only be used once."
+                    + "\nIf you did not request this change, please ignore this email.");
+            default -> new ResetEmail("Obnovení hesla k účtu Bookanear",
+                    "Požádali jste o změnu hesla k účtu Bookanear.\n\n"
+                    + "Odkaz pro nastavení nového hesla:\n"
+                    + link + "\n\n"
+                    + "Odkaz platí " + tokenMinutes + " minut a lze jej použít jen jednou."
+                    + "\nPokud jste o změnu nežádali, zprávu ignorujte.");
+        };
+    }
+
     /** Send a reset link only to verified accounts, without disclosing existence to callers. */
     @Transactional
     public PasswordResetDto.Accepted request(PasswordResetDto.Request req) {
         String email = req.email().trim().toLowerCase(Locale.ROOT);
+        String language = req.language() == null ? "cs" : req.language();
         var users = db.queryForList("""
                 SELECT id FROM users WHERE lower(email)=:email AND email_verified_at IS NOT NULL
                 FOR UPDATE
@@ -92,12 +123,11 @@ public class PasswordResetService {
                 SimpleMailMessage message = new SimpleMailMessage();
                 message.setFrom(fromEmail);
                 message.setTo(email);
-                message.setSubject("Bookanear – obnovení hesla");
-                message.setText("Požádali jste o změnu hesla k účtu Bookanear.\n\n"
-                        + "Odkaz pro nastavení nového hesla:\n"
-                        + FrontendLinks.localized(frontendUrl, "/reset-password") + "?token=" + raw
-                        + "\n\nOdkaz platí " + tokenMinutes + " minut a lze jej použít jen jednou."
-                        + "\nPokud jste o změnu nežádali, zprávu ignorujte.");
+                ResetEmail copy = resetEmail(language,
+                        FrontendLinks.localized(frontendUrl, language, "/reset-password") + "?token=" + raw,
+                        tokenMinutes);
+                message.setSubject(copy.subject());
+                message.setText(copy.text());
                 try {
                     mailSender.send(message);
                 } catch (MailException ex) {

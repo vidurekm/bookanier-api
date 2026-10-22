@@ -3,12 +3,15 @@ package online.bookanear.api.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import online.bookanear.api.dto.SetupDto;
+import online.bookanear.api.dto.InvitationDto;
+import online.bookanear.api.dto.EmailRules;
 import online.bookanear.api.exception.ApiException;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.time.LocalTime;
 import java.util.*;
@@ -17,7 +20,14 @@ import java.util.*;
 public class SetupService {
     private final NamedParameterJdbcTemplate db;
     private final ObjectMapper mapper;
-    public SetupService(NamedParameterJdbcTemplate db, ObjectMapper mapper) { this.db=db; this.mapper=mapper; }
+    private final InvitationService invitationService;
+    @Autowired
+    public SetupService(NamedParameterJdbcTemplate db, ObjectMapper mapper, InvitationService invitationService) {
+        this.db=db; this.mapper=mapper; this.invitationService=invitationService;
+    }
+    public SetupService(NamedParameterJdbcTemplate db, ObjectMapper mapper) {
+        this(db, mapper, null);
+    }
 
     public Object templates() {
         return db.queryForList("SELECT template_key,booking_model,label,steps::text AS steps,defaults::text AS defaults FROM business_templates WHERE active ORDER BY CASE template_key WHEN 'SALON' THEN 0 WHEN 'RESTAURANT' THEN 1 WHEN 'RENTAL' THEN 2 WHEN 'EVENTS' THEN 3 ELSE 4 END", Map.of());
@@ -106,8 +116,18 @@ public class SetupService {
         if(draft.members()!=null) for(var m:draft.members()) {
             if(m==null || m.name()==null || (finalSubmission && m.name().isBlank()))
                 throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Invalid worker name");
+            if(finalSubmission && (m.email()==null || !m.email().trim().matches(EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY)
+                    || m.email().isBlank()))
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","A valid email is required for every team member");
             if(m.locationIndexes()!=null) for(var i:m.locationIndexes()) if(i==null || i<0 || i>=draft.locations().size())
                 throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Invalid worker location");
+        }
+        if (finalSubmission && draft.members() != null) {
+            var emails = new HashSet<String>();
+            for (var member : draft.members()) {
+                if (!emails.add(member.email().trim().toLowerCase(Locale.ROOT)))
+                    throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Each team member must have a unique email");
+            }
         }
         if(draft.services()!=null) for(var service:draft.services()) {
             if(service==null || service.name()==null || (finalSubmission && service.name().isBlank()))
@@ -167,7 +187,8 @@ public class SetupService {
                 .addValue("capacity",options.eventCapacity())
                 .addValue("language",preferredLanguage(options.defaultPublicLanguage()))
                 .addValue("currency",preferredCurrency(options.defaultCurrency()))
-                .addValue("dateFormat",dateFormat(options.dateFormat()));
+                .addValue("dateFormat",dateFormat(options.dateFormat()))
+                .addValue("advanceDays",options.maxAdvanceDays(),java.sql.Types.INTEGER);
         db.update("""
             UPDATE organization_booking_config SET settings=settings || jsonb_build_object(
               'customerSelectResource',CAST(:select AS boolean),
@@ -175,7 +196,8 @@ public class SetupService {
               'eventCapacity',CAST(:capacity AS integer),
               'defaultPublicLanguage',CAST(:language AS text),
               'defaultCurrency',CAST(:currency AS text),
-              'dateFormat',CAST(:dateFormat AS text)),updated_at=now()
+              'dateFormat',CAST(:dateFormat AS text),
+              'maxAdvanceDays',CAST(COALESCE(:advanceDays,COALESCE((settings->>'maxAdvanceDays')::integer,180)) AS integer)),updated_at=now()
             WHERE organization_id=:org
             """,settingArgs);
         return config(org);
@@ -218,9 +240,11 @@ public class SetupService {
         }
         var memberIds=new ArrayList<Long>(); // reservable people ONLY
         var memberBranches=new HashMap<Long,List<Integer>>();
+        var invitationMembers=new ArrayList<Map.Entry<Long,SetupDto.MemberInput>>();
         if(draft.members()!=null) for(var m:draft.members()) {
             Long mid=db.queryForObject("INSERT INTO organization_members(organization_id,display_name,role,can_manage_bookings,can_approve_own_absence) VALUES(:org,:name,'worker',:manage,:approve) RETURNING id",
                 Map.of("org",org,"name",m.name().trim(),"manage",Boolean.TRUE.equals(m.canManageBookings()),"approve",Boolean.TRUE.equals(m.canApproveOwnAbsence())),Long.class);
+            invitationMembers.add(Map.entry(mid,m));
             List<Integer> selected = new ArrayList<>();
             // One primary branch at onboarding: avoid assigning identical worker shifts
             // simultaneously to multiple locations. Additional branches get their own
@@ -293,6 +317,15 @@ public class SetupService {
             for(var mid:memberIds) db.update("INSERT INTO worker_services(organization_id,member_id,service_id) VALUES(:org,:mid,:sid)",Map.of("org",org,"mid",mid,"sid",sid));
         }
         db.update("UPDATE organization_booking_config SET setup_status='complete',locked_at=now(),updated_at=now() WHERE organization_id=:org",Map.of("org",org));
+        if (!invitationMembers.isEmpty()) {
+            if (invitationService == null) throw new IllegalStateException("Invitation service is required to finish onboarding");
+            for (var entry : invitationMembers) {
+                var member = entry.getValue();
+                invitationService.create(org, new InvitationDto.CreateRequest(
+                        member.email(), member.name(), "worker", member.canManageBookings(),
+                        member.canApproveOwnAbsence(), entry.getKey()));
+            }
+        }
         return config(org);
     }
 }

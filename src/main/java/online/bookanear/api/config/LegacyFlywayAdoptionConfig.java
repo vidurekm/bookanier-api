@@ -27,7 +27,7 @@ public class LegacyFlywayAdoptionConfig {
             "notification_outbox", "payments", "payment_refunds", "waitlist_entries",
             "group_sessions", "group_session_attendees", "service_price_overrides", "organization_registration_tokens",
             "resource_types", "reservation_item_resource_demands", "schedule_date_overrides", "schedule_date_override_intervals",
-            "media_assets", "organization_images", "location_images", "service_images",
+            "media_assets", "organization_images", "organization_logos", "location_images", "service_images",
             "resource_images", "member_images", "resource_type_images", "business_templates",
             "organization_booking_config", "event_series", "event_occurrences", "event_registrations"
     );

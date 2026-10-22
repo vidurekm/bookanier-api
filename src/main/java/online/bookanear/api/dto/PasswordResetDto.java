@@ -8,9 +8,15 @@ import jakarta.validation.constraints.Size;
 /** Deliberately use the same response for existing and unknown email addresses. */
 public final class PasswordResetDto {
     private PasswordResetDto() {}
-    public record Request(@NotBlank @Email String email) {}
+    public record Request(
+            @NotBlank @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email,
+            @Pattern(regexp = "cs|sk|pl|en") String language) {
+        public Request(String email) {
+            this(email, "cs");
+        }
+    }
     public record Confirm(
             @NotBlank @Pattern(regexp = "[A-Za-z0-9_-]{32,128}") String token,
-            @NotBlank @Size(min = 12, max = 128) String newPassword) {}
+            @NotBlank @Size(min = 8, max = 128) String newPassword) {}
     public record Accepted(String message) {}
 }

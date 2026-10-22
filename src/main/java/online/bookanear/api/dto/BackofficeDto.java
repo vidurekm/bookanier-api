@@ -13,7 +13,7 @@ public final class BackofficeDto {
     }
 
     @Schema(description = "Organization details for creation.")
-    public record CreateOrganization(@Schema(description = "Organization display name.", example = "Example Studio") @NotBlank String name, @Schema(description = "URL-friendly organization identifier.", example = "example-studio") @NotBlank String slug, @Schema(description = "Organization contact email.", example = "hello@example.com") String email) {
+    public record CreateOrganization(@Schema(description = "Organization display name.", example = "Example Studio") @NotBlank String name, @Schema(description = "URL-friendly organization identifier.", example = "example-studio") @NotBlank String slug, @Schema(description = "Organization contact email.", example = "hello@example.com") @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email) {
     }
 
     @Schema(description = "New organization location.")
@@ -32,13 +32,16 @@ public final class BackofficeDto {
     }
 
     @Schema(description = "New customer contact details.")
-    public record CreateCustomer(@Schema(description = "Customer display name.", example = "Alex Smith") @NotBlank String name, @Schema(description = "Customer contact email.", example = "alex@example.com") @Email String email, @Schema(description = "Customer contact phone number.", example = "+420777123456") String phone) {
+    public record CreateCustomer(@Schema(description = "Customer display name.", example = "Alex Smith") @NotBlank String name, @Schema(description = "Customer contact email.", example = "alex@example.com") @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email, @Schema(description = "Customer contact phone number.", example = "+420777123456") String phone, @Schema(description = "Internal customer notes.", example = "Prefers afternoon appointments") String notes) {
+        public CreateCustomer(String name, String email, String phone) {
+            this(name, email, phone, null);
+        }
     }
 
     @Schema(description = "Editable organization profile and booking configuration.")
     public record OrganizationUpdate(
             @Schema(description = "Organization display name.", example = "Example Studio") @NotBlank String name,
-            @Schema(description = "Organization contact email.", example = "hello@example.com") @Email String email,
+            @Schema(description = "Organization contact email.", example = "hello@example.com") @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email,
             @Schema(description = "Organization contact phone.", example = "+420777123456") String phone,
             @Schema(description = "Default IANA time-zone identifier.", example = "Europe/Prague") @NotBlank String defaultTimezone,
             @Schema(description = "Whether customers can make bookings.", example = "true") boolean bookingEnabled
@@ -89,7 +92,7 @@ public final class BackofficeDto {
     }
 
     @Schema(description = "Editable customer contact details and internal notes.")
-    public record CustomerUpsert(@Schema(description = "Customer display name.", example = "Alex Smith") @NotBlank String name, @Schema(description = "Customer contact email.", example = "alex@example.com") @Email String email, @Schema(description = "Customer contact phone.", example = "+420777123456") String phone, @Schema(description = "Internal customer notes.", example = "Prefers afternoon appointments") String notes) {
+    public record CustomerUpsert(@Schema(description = "Customer display name.", example = "Alex Smith") @NotBlank String name, @Schema(description = "Customer contact email.", example = "alex@example.com") @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email, @Schema(description = "Customer contact phone.", example = "+420777123456") String phone, @Schema(description = "Internal customer notes.", example = "Prefers afternoon appointments") String notes) {
     }
 
     @Schema(description = "Editable organization member role and status.")

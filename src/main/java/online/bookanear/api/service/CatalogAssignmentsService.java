@@ -49,6 +49,20 @@ public class CatalogAssignmentsService {
                 """,Map.of("org",org,"member",member),Long.class);
     }
     @Transactional
+    public List<Long> setMemberServices(long org,long member,List<Long> ids) {
+        ensure(org,"organization_members",member);
+        var wanted=new HashSet<>(ids);
+        for(long id:wanted) ensure(org,"services",id);
+        db.update("UPDATE worker_services SET active=false WHERE organization_id=:org AND member_id=:member",
+                Map.of("org",org,"member",member));
+        for(long id:wanted) db.update("""
+                INSERT INTO worker_services(organization_id,member_id,service_id,active)
+                VALUES(:org,:member,:svc,true)
+                ON CONFLICT(member_id,service_id) DO UPDATE SET active=true
+                """,Map.of("org",org,"member",member,"svc",id));
+        return wanted.stream().sorted().toList();
+    }
+    @Transactional
     public List<Long> setMemberLocations(long org,long member,List<Long> ids) {
         ensure(org,"organization_members",member);
         var wanted=new HashSet<>(ids);

@@ -48,6 +48,16 @@ public class BookingService {
         if (!condition) throw new ApiException(HttpStatus.CONFLICT, msg);
     }
 
+    private int maxAdvanceDays(long org, long loc) {
+        return db.queryForObject("""
+                SELECT LEAST(COALESCE(p.max_advance_days,3650),
+                             COALESCE((c.settings->>'maxAdvanceDays')::integer,180))
+                FROM organization_booking_config c
+                LEFT JOIN booking_policies p ON p.organization_id=c.organization_id AND p.location_id=:loc
+                WHERE c.organization_id=:org
+                """, Map.of("org",org,"loc",loc), Integer.class);
+    }
+
     private static OffsetDateTime utc(OffsetDateTime dt) {
         return dt.withOffsetSameInstant(ZoneOffset.UTC);
     }
@@ -69,7 +79,7 @@ public class BookingService {
     }
 
     private Map<String, Object> context(long org, long loc, long member, long service) {
-        var rows = db.queryForList("select l.timezone from organizations o join locations l on l.organization_id=o.id and l.id=:loc join organization_members m on m.organization_id=o.id and m.id=:member join member_locations ml on ml.member_id=m.id and ml.location_id=l.id join services s on s.organization_id=o.id and s.id=:svc join worker_services ws on ws.member_id=m.id and ws.service_id=s.id and ws.active join location_services ls on ls.location_id=l.id and ls.service_id=s.id and ls.active where o.id=:org and o.booking_enabled and l.active and m.active and s.active", Map.of("org", org, "loc", loc, "member", member, "svc", service));
+        var rows = db.queryForList("select l.timezone from organizations o join locations l on l.organization_id=o.id and l.id=:loc join organization_members m on m.organization_id=o.id and m.id=:member join member_locations ml on ml.member_id=m.id and ml.location_id=l.id join services s on s.organization_id=o.id and s.id=:svc join worker_services ws on ws.member_id=m.id and ws.service_id=s.id and ws.active join location_services ls on ls.location_id=l.id and ls.service_id=s.id and ls.active where o.id=:org and o.booking_enabled and l.active and l.archived_at is null and m.active and m.archived_at is null and s.active", Map.of("org", org, "loc", loc, "member", member, "svc", service));
         if (rows.isEmpty()) throw new ApiException(HttpStatus.BAD_REQUEST, "Service/member/location not configured");
         return rows.getFirst();
     }
@@ -139,8 +149,8 @@ public class BookingService {
         if (!policy.isEmpty()) {
             var policyRow = policy.getFirst();
             ensure(!start.isBefore(OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(((Number) policyRow.get("min_notice_minutes")).longValue())), "Too little notice");
-            ensure(!start.isAfter(OffsetDateTime.now(ZoneOffset.UTC).plusDays(((Number) policyRow.get("max_advance_days")).longValue())), "Too far in advance");
         }
+        ensure(!start.isAfter(OffsetDateTime.now(ZoneOffset.UTC).plusDays(maxAdvanceDays(org,loc))), "Too far in advance");
     }
 
     private Map<String, Object> tokenRow(String token, boolean lock) {
@@ -199,7 +209,7 @@ public class BookingService {
 
         var context = db.queryForList("""
                 SELECT l.timezone FROM organizations o
-                JOIN locations l ON l.organization_id=o.id AND l.id=:loc AND l.active
+                JOIN locations l ON l.organization_id=o.id AND l.id=:loc AND l.active AND l.archived_at IS NULL
                 JOIN services s ON s.organization_id=o.id AND s.id=:service AND s.active
                 JOIN location_services ls ON ls.location_id=l.id AND ls.service_id=s.id AND ls.active
                 WHERE o.id=:org AND o.booking_enabled AND o.registration_status='active'
@@ -275,8 +285,8 @@ public class BookingService {
         if (!policies.isEmpty()) {
             var policy = policies.getFirst();
             ensure(!start.isBefore(now.plusMinutes(((Number) policy.get("min_notice_minutes")).longValue())), "Too little notice");
-            ensure(!start.isAfter(now.plusDays(((Number) policy.get("max_advance_days")).longValue())), "Too far in advance");
         }
+        ensure(!start.isAfter(now.plusDays(maxAdvanceDays(org,loc))), "Too far in advance");
         if ("CUSTOM".equals(v.durationMode())) {
             // Rental: pickup and return must each happen during opening hours.
             checkOpeningTime(org, loc, start, zone);

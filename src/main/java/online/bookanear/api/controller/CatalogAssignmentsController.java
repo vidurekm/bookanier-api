@@ -32,6 +32,12 @@ public class CatalogAssignmentsController {
     public List<Long> memberLocations(@PathVariable long org,@PathVariable long member) {
         return service.memberLocations(org,member);
     }
+    @PutMapping("/members/{member}/services")
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    public List<Long> setMemberServices(@PathVariable long org,@PathVariable long member,
+                                        @Valid @RequestBody Ids body) {
+        return service.setMemberServices(org,member,body.ids());
+    }
     @PutMapping("/members/{member}/locations")
     @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
     public List<Long> setMemberLocations(@PathVariable long org,@PathVariable long member,

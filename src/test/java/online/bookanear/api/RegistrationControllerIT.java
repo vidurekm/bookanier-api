@@ -74,6 +74,23 @@ class RegistrationControllerIT extends PostgresIntegrationTest {
     }
 
     @Test
+    void verificationEmailUsesTheLanguageSelectedDuringRegistration() throws Exception {
+        mvc.perform(post(REGISTER).contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"organizationName":"Example Studio","ownerName":"Alex Smith",
+                                 "email":"owner@example.com","password":"a-long-strong-password","language":"en"}
+                                """))
+                .andExpect(status().isAccepted());
+
+        ArgumentCaptor<SimpleMailMessage> captor = ArgumentCaptor.forClass(SimpleMailMessage.class);
+        verify(mailSender).send(captor.capture());
+        var message = captor.getValue();
+        assertThat(message.getSubject()).isEqualTo("Verify your Bookanear account");
+        assertThat(message.getText()).contains("Hello Alex Smith", "Thank you for choosing the Bookanear booking system.",
+                "VERIFY EMAIL ADDRESS: http://localhost:5173/en/verify-email?token=", "valid for 24 hours");
+    }
+
+    @Test
     void verificationActivatesOrganizationAndCannotBeReused() throws Exception {
         String token = registerAndGetToken();
         String body = "{\"token\":\"" + token + "\"}";
@@ -122,6 +139,29 @@ class RegistrationControllerIT extends PostgresIntegrationTest {
                 .andExpect(status().isConflict());
         assertThat(db.queryForObject("SELECT COUNT(*) FROM users", Map.of(), Integer.class)).isEqualTo(1);
         assertThat(db.queryForObject("SELECT COUNT(*) FROM organizations", Map.of(), Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void registrationRejectsShortDomainAndSupportsEightCharacterPassword() throws Exception {
+        mvc.perform(post(REGISTER).contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"organizationName":"Studio","ownerName":"Owner",
+                                 "email":"df@s","password":"12345678"}
+                                """))
+                .andExpect(status().isBadRequest());
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM users", Map.of(), Integer.class)).isZero();
+        mvc.perform(post(REGISTER).contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"organizationName":"Studio","ownerName":"Owner",
+                                 "email":"owner@example.cz","password":"1234567"}
+                                """))
+                .andExpect(status().isBadRequest());
+        mvc.perform(post(REGISTER).contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"organizationName":"Studio","ownerName":"Owner",
+                                 "email":"owner@example.cz","password":"12345678"}
+                                """))
+                .andExpect(status().isAccepted());
     }
 
     @Test

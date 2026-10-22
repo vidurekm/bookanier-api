@@ -95,9 +95,9 @@ public class BackofficeController {
     @DeleteMapping("/{org}/services/{id}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
-    @Operation(summary = "Deactivate service", description = "Deactivate the service without deleting its historical records.")
-    public void deactivateService(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id) {
-        service.deactivateService(org, id);
+    @Operation(summary = "Delete unused service", description = "Permanently delete a service only if it has never been used by a reservation or waitlist entry.")
+    public void deleteService(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id) {
+        service.deleteService(org, id);
     }
 
     @GetMapping("/{org}/services/{id}/versions")
@@ -129,6 +129,14 @@ public class BackofficeController {
         return service.updateLocation(org, id, r);
     }
 
+    @DeleteMapping("/{org}/locations/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    @Operation(summary = "Archive location", description = "Archive a location after all future active reservations have been cancelled. Historical records are retained.")
+    public void archiveLocation(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id) {
+        service.archiveLocation(org, id);
+    }
+
     @GetMapping("/{org}/members/{id}")
     @PreAuthorize("@organizationSecurity.canAccessMember(#p0, #p1, authentication)")
     @Operation(summary = "Get organization member", description = "Get an organization member, subject to role-based access.")
@@ -136,19 +144,19 @@ public class BackofficeController {
         return service.member(org, id);
     }
 
-    @PostMapping("/{org}/members")
-    @ResponseStatus(HttpStatus.CREATED)
-    @PreAuthorize("@organizationSecurity.isOwner(#p0, authentication)")
-    @Operation(summary = "Create organization member", description = "Create an organization member. Owner permission is required.")
-    public Object createMember(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Valid @RequestBody BackofficeDto.MemberUpsert r) {
-        return service.createMember(org, r);
-    }
-
     @PutMapping("/{org}/members/{id}")
     @PreAuthorize("@organizationSecurity.isOwner(#p0, authentication)")
     @Operation(summary = "Update organization member", description = "Update member details, role and active status. Owner permission is required.")
     public Object updateMember(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id, @Valid @RequestBody BackofficeDto.MemberUpsert r) {
         return service.updateMember(org, id, r);
+    }
+
+    @DeleteMapping("/{org}/members/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("@organizationSecurity.isOwner(#p0, authentication)")
+    @Operation(summary = "Remove worker from organization", description = "Archive a worker membership after future active reservations have been cancelled. The user's account and historical records are retained.")
+    public void archiveMember(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the organization member.") @PathVariable long id) {
+        service.archiveMember(org, id);
     }
 
     @GetMapping("/{org}/members/{id}/services")
@@ -177,6 +185,14 @@ public class BackofficeController {
     @Operation(summary = "Update customer", description = "Update customer contact details and internal notes.")
     public Object updateCustomer(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id, @Valid @RequestBody BackofficeDto.CustomerUpsert r) {
         return service.updateCustomer(org, id, r);
+    }
+
+    @DeleteMapping("/{org}/customers/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    @Operation(summary = "Delete customer", description = "Delete a customer while preserving reservation history.")
+    public void deleteCustomer(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the customer.") @PathVariable long id) {
+        service.deleteCustomer(org, id);
     }
 
     @GetMapping("/{org}/reservations/{id}")

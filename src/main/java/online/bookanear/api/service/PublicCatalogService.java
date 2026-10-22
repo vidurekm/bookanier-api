@@ -17,8 +17,10 @@ public class PublicCatalogService {
 
     private Map<String,Object> organization(UUID publicId) {
         var rows = db.queryForList("""
-                SELECT id,public_id,name,booking_enabled FROM organizations
-                WHERE public_id=:id AND registration_status='active'
+                SELECT o.id,o.public_id,o.name,o.booking_enabled,
+                       COALESCE((c.settings->>'maxAdvanceDays')::integer,180) AS max_advance_days
+                FROM organizations o JOIN organization_booking_config c ON c.organization_id=o.id
+                WHERE o.public_id=:id AND o.registration_status='active'
                 """, Map.of("id", publicId));
         if (rows.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Organization not found");
         return rows.getFirst();
@@ -29,7 +31,7 @@ public class PublicCatalogService {
         long id = ((Number)org.get("id")).longValue();
         var locations = db.queryForList("""
                 SELECT id,name,address,timezone,latitude,longitude FROM locations
-                WHERE organization_id=:org AND active=true ORDER BY name
+                WHERE organization_id=:org AND active=true AND archived_at IS NULL ORDER BY name
                 """, Map.of("org", id));
         var services = db.queryForList("""
                 SELECT s.id,s.name,s.description,sv.duration_minutes,sv.slot_interval_minutes,
@@ -40,8 +42,9 @@ public class PublicCatalogService {
                 ORDER BY s.name
                 """, Map.of("org", id, "day", date));
         var links = db.queryForList("""
-                SELECT location_id,service_id FROM location_services
-                WHERE organization_id=:org AND active=true
+                SELECT ls.location_id,ls.service_id FROM location_services ls
+                JOIN locations l ON l.id=ls.location_id AND l.organization_id=ls.organization_id
+                WHERE ls.organization_id=:org AND ls.active=true AND l.active=true AND l.archived_at IS NULL
                 """, Map.of("org", id));
         var reqs = db.queryForList("""
                 SELECT r.service_id,r.resource_type_id,r.quantity,r.min_capacity,t.category,t.code AS type_code,t.name AS type_name
@@ -54,7 +57,7 @@ public class PublicCatalogService {
                 FROM organization_members m
                 JOIN member_locations ml ON ml.member_id=m.id AND ml.organization_id=m.organization_id
                 JOIN worker_services ws ON ws.member_id=m.id AND ws.organization_id=m.organization_id AND ws.active=true
-                WHERE m.organization_id=:org AND m.active=true ORDER BY m.display_name
+                WHERE m.organization_id=:org AND m.active=true AND m.archived_at IS NULL ORDER BY m.display_name
                 """, Map.of("org", id));
         var catalogServices = new ArrayList<Map<String,Object>>();
         for (var s : services) {
@@ -76,7 +79,8 @@ public class PublicCatalogService {
         long orgId = ((Number)org.get("id")).longValue();
         if (!Boolean.TRUE.equals(org.get("booking_enabled")))
             throw new ApiException(HttpStatus.CONFLICT, "Bookings are disabled");
-        if (date.isBefore(LocalDate.now().minusDays(1)) || date.isAfter(LocalDate.now().plusDays(366)))
+        int organizationAdvance = ((Number)org.get("max_advance_days")).intValue();
+        if (date.isBefore(LocalDate.now().minusDays(1)) || date.isAfter(LocalDate.now().plusDays(3650)))
             throw new ApiException(HttpStatus.BAD_REQUEST, "Date outside supported range");
         if (partySize != null && (partySize < 1 || partySize > 100))
             throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid party size");
@@ -88,7 +92,7 @@ public class PublicCatalogService {
                 FROM locations l JOIN location_services ls ON ls.location_id=l.id AND ls.active
                 JOIN services s ON s.id=ls.service_id AND s.organization_id=l.organization_id AND s.active
                 JOIN service_versions sv ON sv.service_id=s.id AND sv.valid_during @> CAST(:day AS date)
-                WHERE l.id=:loc AND l.organization_id=:org AND l.active AND s.id=:svc
+                WHERE l.id=:loc AND l.organization_id=:org AND l.active AND l.archived_at IS NULL AND s.id=:svc
                 """, Map.of("org", orgId,"loc",locationId,"svc",serviceId,"day",date));
         if (ctx.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND,"Service not available at location on this date");
         var version = ctx.getFirst();
@@ -113,12 +117,13 @@ public class PublicCatalogService {
                 SELECT m.id FROM organization_members m
                 JOIN member_locations ml ON ml.member_id=m.id AND ml.location_id=:loc
                 JOIN worker_services ws ON ws.member_id=m.id AND ws.service_id=:svc AND ws.active
-                WHERE m.organization_id=:org AND m.active
+                WHERE m.organization_id=:org AND m.active AND m.archived_at IS NULL
                 """, Map.of("org",orgId,"loc",locationId,"svc",serviceId));
         var policy = db.queryForList("SELECT min_notice_minutes,max_advance_days FROM booking_policies WHERE location_id=:loc",
                 Map.of("loc",locationId));
         int notice = policy.isEmpty()?0:((Number)policy.getFirst().get("min_notice_minutes")).intValue();
-        int advance = policy.isEmpty()?180:((Number)policy.getFirst().get("max_advance_days")).intValue();
+        int advance = policy.isEmpty() ? organizationAdvance : Math.min(organizationAdvance,
+                ((Number)policy.getFirst().get("max_advance_days")).intValue());
         var now = Instant.now();
         var slots = new ArrayList<Map<String,Object>>();
         var seen = new HashSet<String>();

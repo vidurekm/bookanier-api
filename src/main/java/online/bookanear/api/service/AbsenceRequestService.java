@@ -47,6 +47,28 @@ public class AbsenceRequestService {
                 """,new MapSqlParameterSource().addValue("org",org).addValue("manager",manager).addValue("member",memberId));
     }
 
+    public Object locations(long org, Authentication auth) {
+        if (!security.canRead(org,auth))
+            throw new ApiException(HttpStatus.FORBIDDEN,"FORBIDDEN","Access denied");
+        if (security.canWrite(org,auth))
+            return db.queryForList("""
+                    SELECT id,name,address,timezone,active,latitude,longitude
+                    FROM locations WHERE organization_id=:org AND active=true
+                    ORDER BY name,id
+                    """,Map.of("org",org));
+
+        Long memberId=security.ownMemberId(org,auth);
+        if (memberId==null) throw new ApiException(HttpStatus.FORBIDDEN,"FORBIDDEN","Access denied");
+        return db.queryForList("""
+                SELECT l.id,l.name,l.address,l.timezone,l.active,l.latitude,l.longitude
+                FROM locations l
+                JOIN member_locations ml ON ml.organization_id=l.organization_id AND ml.location_id=l.id
+                JOIN organization_members m ON m.organization_id=ml.organization_id AND m.id=ml.member_id
+                WHERE l.organization_id=:org AND l.active=true AND m.id=:member AND m.active=true
+                ORDER BY l.name,l.id
+                """,Map.of("org",org,"member",memberId));
+    }
+
     @Transactional
     public Object create(long org, CreateRequest request, Authentication auth) {
         Long userId=security.authenticatedUserId(auth);

@@ -21,6 +21,7 @@ import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 import org.springframework.stereotype.Service;
 
@@ -33,6 +34,46 @@ public class RegistrationService {
     @Value("${registration.home-url:http://localhost:5173/}") private String frontendUrl;
     @Value("${registration.from-email}") private String fromEmail;
     @Value("${registration.token-hours:24}") private long tokenHours;
+    private record VerificationEmail(String subject, String text) {}
+
+    private static VerificationEmail verificationEmail(String language, String ownerName,
+                                                       String link, long tokenHours) {
+        return switch (language) {
+            case "sk" -> new VerificationEmail("Potvrďte svoj účet Bookanear",
+                    "Dobrý deň, " + ownerName + ",\n\n"
+                    + "ďakujeme, že ste si vybrali rezervačný systém Bookanear.\n"
+                    + "Na aktiváciu účtu a dokončenie registrácie potvrďte svoju e-mailovú adresu:\n\n"
+                    + "POTVRDIŤ E-MAIL: " + link + "\n\n"
+                    + "Odkaz je platný " + tokenHours + " hodín a možno ho použiť iba raz. "
+                    + "Ak ste registráciu nezačali vy, tento e-mail môžete ignorovať.\n\n"
+                    + "S pozdravom\nTím Bookanear");
+            case "pl" -> new VerificationEmail("Potwierdź swoje konto Bookanear",
+                    "Dzień dobry, " + ownerName + ",\n\n"
+                    + "Dziękujemy za wybór systemu rezerwacji Bookanear.\n"
+                    + "Aby aktywować konto i dokończyć rejestrację, potwierdź swój adres e-mail:\n\n"
+                    + "POTWIERDŹ ADRES E-MAIL: " + link + "\n\n"
+                    + "Link jest ważny przez " + tokenHours + " godzin i można go użyć tylko raz. "
+                    + "Jeśli rejestracja nie została przez Ciebie rozpoczęta, możesz zignorować tę wiadomość.\n\n"
+                    + "Pozdrawiamy\nZespół Bookanear");
+            case "en" -> new VerificationEmail("Verify your Bookanear account",
+                    "Hello " + ownerName + ",\n\n"
+                    + "Thank you for choosing the Bookanear booking system.\n"
+                    + "To activate your account and complete registration, please verify your email address:\n\n"
+                    + "VERIFY EMAIL ADDRESS: " + link + "\n\n"
+                    + "This link is valid for " + tokenHours + " hours and can only be used once. "
+                    + "If you did not start this registration, you can safely ignore this email.\n\n"
+                    + "Kind regards,\nThe Bookanear team");
+            default -> new VerificationEmail("Potvrďte svůj účet Bookanear",
+                    "Dobrý den, " + ownerName + ",\n\n"
+                    + "děkujeme, že jste si vybrali rezervační systém Bookanear.\n"
+                    + "Pro aktivaci účtu a dokončení registrace potvrďte svou e-mailovou adresu:\n\n"
+                    + "POTVRDIT E-MAIL: " + link + "\n\n"
+                    + "Odkaz platí " + tokenHours + " hodin a lze jej použít pouze jednou. "
+                    + "Pokud jste registraci nezahájili, můžete tento e-mail bezpečně ignorovat.\n\n"
+                    + "S pozdravem\nTým Bookanear");
+        };
+    }
+
     public RegistrationService(NamedParameterJdbcTemplate db, JavaMailSender mailSender) {
         this.db=db; this.mailSender=mailSender;
     }
@@ -53,6 +94,9 @@ public class RegistrationService {
 
     @Transactional
     public Map<String, String> register(RegistrationDto.RegisterRequest req) {
+        String language = req.language() == null ? "cs" : req.language();
+        if (!Set.of("cs", "sk", "pl", "en").contains(language))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR", "Unsupported email language");
         String email = req.email().trim().toLowerCase(Locale.ROOT);
         var p = new MapSqlParameterSource().addValue("email", email).addValue("name", req.ownerName().trim()).addValue("password", passwordEncoder.encode(req.password()));
         // A pre-existing email must be handled by the account-linking workflow, not silently overwritten.
@@ -74,11 +118,13 @@ public class RegistrationService {
                 INSERT INTO organization_registration_tokens(organization_id,user_id,token_hash,expires_at)
                 VALUES (:org,:user,:hash,:expires)
                 """, new MapSqlParameterSource().addValue("org", orgId).addValue("user", userId).addValue("hash", hash(token)).addValue("expires", OffsetDateTime.now(ZoneOffset.UTC).plusHours(tokenHours)));
+        String link = FrontendLinks.localized(FrontendLinks.base(frontendUrl), language, "/verify-email") + "?token=" + token;
+        VerificationEmail copy = verificationEmail(language, req.ownerName().trim(), link, tokenHours);
         SimpleMailMessage message = new SimpleMailMessage();
         message.setFrom(fromEmail);
         message.setTo(email);
-        message.setSubject("Potvrzení registrace subjektu");
-        message.setText("Pro potvrzení registrace otevřete odkaz:\n" + FrontendLinks.localized(FrontendLinks.base(frontendUrl), "/verify-email") + "?token=" + token + "\n\nOdkaz platí " + tokenHours + " hodin. Pokud jste registraci neprováděli, e-mail ignorujte.");
+        message.setSubject(copy.subject());
+        message.setText(copy.text());
         mailSender.send(message);
         return Map.of("message", "Registration created; check your email");
     }

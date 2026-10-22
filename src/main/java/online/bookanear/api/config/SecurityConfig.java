@@ -44,7 +44,9 @@ public class SecurityConfig {
                                 "/api/v1/auth/login",
                                 "/api/v1/auth/password/forgot",
                                 "/api/v1/auth/password/reset",
-                                "/api/v1/registration"
+                                "/api/v1/auth/email/confirm",
+                                "/api/v1/registration",
+                                "/api/v1/invitations/accept"
                         ).permitAll()
 
                         // Old verification links only redirect to the React form.
@@ -53,7 +55,9 @@ public class SecurityConfig {
                         // Browser diagnostics are unauthenticated so even login/onboarding failures are logged.
                         .requestMatchers(HttpMethod.POST, "/api/v1/frontend-errors").permitAll()
                         .requestMatchers("/api/v1/registration/**").permitAll()
+                        .requestMatchers("/api/v1/invitations").permitAll()
                         .requestMatchers("/api/v1/public/**").permitAll()
+                        .requestMatchers("/api/v1/auth/me", "/api/v1/auth/me/**").authenticated()
 
                         .requestMatchers(
                                 HttpMethod.POST,
