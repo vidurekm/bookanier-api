@@ -24,10 +24,16 @@ public class BackofficeService {
     private final NamedParameterJdbcTemplate db;
     private final OrganizationSecurity organizationSecurity;
     private final MemberScheduleConflictValidator memberScheduleConflictValidator;
+    private final OrganizationDeletionService organizationDeletionService;
+    private final StaffResourceService staffResourceService;
     public BackofficeService(NamedParameterJdbcTemplate db, OrganizationSecurity organizationSecurity,
-                             MemberScheduleConflictValidator memberScheduleConflictValidator) {
+                             MemberScheduleConflictValidator memberScheduleConflictValidator,
+                             OrganizationDeletionService organizationDeletionService,
+                             StaffResourceService staffResourceService) {
         this.db=db; this.organizationSecurity=organizationSecurity;
         this.memberScheduleConflictValidator=memberScheduleConflictValidator;
+        this.organizationDeletionService=organizationDeletionService;
+        this.staffResourceService=staffResourceService;
     }
     private Map<String, Object> one(String sql, Map<String, ?> params) {
         var result = db.queryForList(sql, params);
@@ -37,6 +43,39 @@ public class BackofficeService {
 
     private Map<String, Object> p(long org, long id) {
         return Map.of("org", org, "id", id);
+    }
+
+    @Transactional
+    public Map<String, Object> createOrganization(BackofficeDto.OrganizationCreate request,
+                                                  Authentication authentication) {
+        Long userId = organizationSecurity.authenticatedUserId(authentication);
+        if (userId == null) throw new ApiException(HttpStatus.UNAUTHORIZED, "Authentication required");
+
+        var users = db.queryForList("""
+                SELECT name, email FROM users
+                WHERE id=:user AND email_verified_at IS NOT NULL
+                """, Map.of("user", userId));
+        if (users.isEmpty()) throw new ApiException(HttpStatus.UNAUTHORIZED, "Authentication required");
+
+        var user = users.getFirst();
+        Long organizationId = db.queryForObject("""
+                INSERT INTO organizations(name,email,booking_enabled,registration_status,verified_at)
+                VALUES (:name,:email,true,'active',now()) RETURNING id
+                """, new MapSqlParameterSource()
+                .addValue("name", request.name().trim())
+                .addValue("email", user.get("email")), Long.class);
+        if (organizationId == null) throw new IllegalStateException("Organization insert did not return an id");
+
+        db.update("INSERT INTO organization_booking_config(organization_id) VALUES(:org)",
+                Map.of("org", organizationId));
+        db.update("""
+                INSERT INTO organization_members(organization_id,user_id,display_name,role)
+                VALUES (:org,:user,:name,'owner')
+                """, new MapSqlParameterSource()
+                .addValue("org", organizationId)
+                .addValue("user", userId)
+                .addValue("name", user.get("name")));
+        return Map.of("id", organizationId, "name", request.name().trim());
     }
 
     public Object service(long org, long id) {
@@ -89,6 +128,9 @@ public class BackofficeService {
 
     @Transactional
     public Object createResourceType(long org, BackofficeDto.ResourceTypeCreate r) {
+        if (appointmentModel(org) && !"equipment".equals(r.category()))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                    "Appointment services support equipment resource types only");
         return one("""
                 INSERT INTO resource_types(organization_id,name,category)
                 VALUES(:org,:name,:category) RETURNING *
@@ -99,6 +141,9 @@ public class BackofficeService {
     public Object updateResourceType(long org, long id, BackofficeDto.ResourceTypeUpdate r) {
         var existing = one("SELECT category FROM resource_types WHERE organization_id=:org AND id=:id",p(org,id));
         if (!existing.get("category").equals(r.category())) {
+            if (appointmentModel(org) && !"equipment".equals(r.category()))
+                throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                        "Appointment services support equipment resource types only");
             var used = db.queryForObject("""
                 SELECT EXISTS(SELECT 1 FROM resources WHERE organization_id=:org AND resource_type_id=:id)
                   OR EXISTS(SELECT 1 FROM service_resource_requirements WHERE resource_type_id=:id)
@@ -111,6 +156,40 @@ public class BackofficeService {
                 WHERE organization_id=:org AND id=:id RETURNING *
                 """, Map.of("org", org, "id", id, "name", r.name(),
                         "category", r.category(), "active", r.active()));
+    }
+
+    private boolean appointmentModel(long org) {
+        return Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(
+                    SELECT 1 FROM organization_booking_config
+                    WHERE organization_id=:org AND booking_model='APPOINTMENT'
+                )
+                """, Map.of("org", org), Boolean.class));
+    }
+
+    @Transactional
+    public void deleteResourceType(long org, long id) {
+        var existing = db.queryForList("""
+                SELECT category FROM resource_types
+                WHERE organization_id=:org AND id=:id
+                FOR UPDATE
+                """, p(org, id));
+        if (existing.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Resource type not found");
+        if ("staff".equals(existing.get(0).get("category")))
+            throw new ApiException(HttpStatus.CONFLICT, "RESOURCE_TYPE_IN_USE",
+                    "Staff resource types are managed by the team");
+
+        boolean used = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM resources WHERE organization_id=:org AND resource_type_id=:id)
+                    OR EXISTS(SELECT 1 FROM service_resource_requirements WHERE resource_type_id=:id)
+                """, p(org, id), Boolean.class));
+        if (used) throw new ApiException(HttpStatus.CONFLICT, "RESOURCE_TYPE_IN_USE",
+                "A resource type used by resources or services cannot be deleted");
+
+        db.update("DELETE FROM resource_type_images WHERE organization_id=:org AND resource_type_id=:id",
+                p(org, id));
+        if (db.update("DELETE FROM resource_types WHERE organization_id=:org AND id=:id", p(org, id)) == 0)
+            throw new ApiException(HttpStatus.NOT_FOUND, "Resource type not found");
     }
 
     public Object resources(long org, long loc) {
@@ -167,16 +246,122 @@ public class BackofficeService {
                 .addValue("active", r.active()).addValue("state", r.resourceState()).getValues());
     }
 
+    @Transactional
+    public void deleteResource(long org, long loc, long id) {
+        var current = db.queryForList("""
+                SELECT r.id, r.member_id, rt.category
+                FROM resources r
+                JOIN resource_types rt ON rt.id=r.resource_type_id
+                WHERE r.organization_id=:org AND r.location_id=:loc AND r.id=:id
+                FOR UPDATE OF r
+                """, Map.of("org", org, "loc", loc, "id", id));
+        if (current.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Resource not found");
+        var resource = current.get(0);
+        boolean reserved = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM reservation_resources
+                              WHERE organization_id=:org AND location_id=:loc AND resource_id=:id)
+                    OR EXISTS(SELECT 1 FROM reservation_item_resource_demands
+                              WHERE organization_id=:org AND location_id=:loc AND preferred_resource_id=:id)
+                """, Map.of("org", org, "loc", loc, "id", id), Boolean.class));
+        if (reserved || resource.get("member_id") != null)
+            throw new ApiException(HttpStatus.CONFLICT, "RESOURCE_IN_USE",
+                    "A resource used in reservations or managed by a team member cannot be deleted");
+
+        db.update("DELETE FROM resource_images WHERE organization_id=:org AND resource_id=:id",
+                Map.of("org", org, "id", id));
+        if (db.update("DELETE FROM resources WHERE organization_id=:org AND location_id=:loc AND id=:id",
+                Map.of("org", org, "loc", loc, "id", id)) == 0)
+            throw new ApiException(HttpStatus.NOT_FOUND, "Resource not found");
+    }
+
     public Object resourceRequirements(long org, long serviceId) {
         service(org, serviceId);
         return db.queryForList("""
                 SELECT req.resource_type_id,rt.code AS resource_type,rt.name AS resource_type_name,rt.category,
                        req.quantity,req.min_capacity
                 FROM service_resource_requirements req
-                JOIN resource_types rt ON rt.id=req.resource_type_id
+                JOIN resource_types rt ON rt.id=req.resource_type_id AND rt.organization_id=s.organization_id
                 WHERE req.service_id=:service AND rt.organization_id=:org
                 ORDER BY rt.name
                 """, Map.of("org", org, "service", serviceId));
+    }
+
+    public Object serviceBookingOptions(long org, long serviceId) {
+        service(org, serviceId);
+        return one("""
+                SELECT s.customer_can_choose_staff,s.customer_can_choose_resource,
+                       COALESCE((SELECT req.quantity FROM service_resource_requirements req
+                           JOIN resource_types rt ON rt.id=req.resource_type_id
+                           WHERE req.service_id=s.id AND rt.category='staff'),1) AS required_staff_count
+                FROM services s WHERE s.organization_id=:org AND s.id=:id
+                """, p(org, serviceId));
+    }
+
+    @Transactional
+    public Object updateServiceBookingOptions(long org, long serviceId,
+                                              BackofficeDto.ServiceBookingOptions request) {
+        service(org, serviceId);
+        Long staffRequirements = db.queryForObject("""
+                SELECT count(*) FROM service_resource_requirements req
+                JOIN resource_types rt ON rt.id=req.resource_type_id
+                WHERE req.service_id=:id AND rt.organization_id=:org AND rt.category='staff' AND rt.active
+                """, p(org, serviceId), Long.class);
+        Long resourceRequirements = db.queryForObject("""
+                SELECT count(*) FROM service_resource_requirements req
+                JOIN resource_types rt ON rt.id=req.resource_type_id
+                WHERE req.service_id=:id AND rt.organization_id=:org AND rt.category<>'staff' AND rt.active
+                """, p(org, serviceId), Long.class);
+        Long singleUnitRequirements = db.queryForObject("""
+                SELECT count(*) FROM service_resource_requirements req
+                JOIN resource_types rt ON rt.id=req.resource_type_id
+                WHERE req.service_id=:id AND rt.organization_id=:org
+                  AND rt.category<>'staff' AND rt.active AND req.quantity=1
+                """, p(org, serviceId), Long.class);
+        if (staffRequirements != null && staffRequirements > 1)
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                    "Multiple staff requirement types are not supported");
+        if (Boolean.TRUE.equals(request.customerCanChooseResource())
+                && (resourceRequirements == null || resourceRequirements != 1
+                    || singleUnitRequirements == null || singleUnitRequirements != 1))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                    "Customer resource choice requires one non-staff resource of quantity one");
+        if ((staffRequirements == null || staffRequirements == 0) && request.requiredStaffCount() != 1)
+            if (appointmentModel(org)) {
+                Long staffType=db.queryForObject("""
+                        SELECT id FROM resource_types WHERE organization_id=:org
+                          AND category='staff' AND active ORDER BY id LIMIT 1
+                        """,Map.of("org",org),Long.class);
+                if (staffType==null)
+                    throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR",
+                            "Add bookable team members before requiring multiple staff members");
+                db.update("""
+                        INSERT INTO service_resource_requirements
+                            (service_id,resource_type,resource_type_id,quantity,min_capacity)
+                        SELECT :id,rt.code,rt.id,:quantity,NULL FROM resource_types rt
+                        WHERE rt.organization_id=:org AND rt.id=:type
+                        """,new MapSqlParameterSource().addValue("org",org).addValue("id",serviceId)
+                        .addValue("type",staffType).addValue("quantity",request.requiredStaffCount()));
+                staffRequirements=1L;
+            } else {
+                throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                        "Required staff count can only change for appointment services");
+            }
+        if (staffRequirements != null && staffRequirements == 1)
+            db.update("""
+                    UPDATE service_resource_requirements req SET quantity=:quantity
+                    FROM resource_types rt
+                    WHERE req.service_id=:id AND rt.id=req.resource_type_id
+                      AND rt.organization_id=:org AND rt.category='staff'
+                    """, new MapSqlParameterSource().addValue("org",org).addValue("id",serviceId)
+                    .addValue("quantity",request.requiredStaffCount()));
+        db.update("""
+                UPDATE services SET customer_can_choose_staff=:staff,
+                    customer_can_choose_resource=:resource
+                WHERE organization_id=:org AND id=:id
+                """, new MapSqlParameterSource().addValue("org",org).addValue("id",serviceId)
+                .addValue("staff",request.customerCanChooseStaff())
+                .addValue("resource",request.customerCanChooseResource()));
+        return serviceBookingOptions(org, serviceId);
     }
 
     @Transactional
@@ -184,16 +369,22 @@ public class BackofficeService {
                                                BackofficeDto.ResourceRequirements request) {
         service(org, serviceId);
         var seen = new java.util.HashSet<Long>();
+        var staffTypes = new java.util.HashSet<Long>();
         for (var req : request.requirements()) {
             if (!seen.add(req.resourceTypeId()))
                 throw new ApiException(HttpStatus.BAD_REQUEST, "Duplicate resource type");
             var type = one("SELECT category FROM resource_types WHERE organization_id=:org AND id=:id AND active",
                     p(org, req.resourceTypeId()));
-            if ("staff".equals(type.get("category")) && req.quantity() != 1)
-                throw new ApiException(HttpStatus.BAD_REQUEST, "Only one staff resource is supported");
+            if ("staff".equals(type.get("category"))) staffTypes.add(req.resourceTypeId());
         }
-        db.update("DELETE FROM service_resource_requirements WHERE service_id=:id", Map.of("id", serviceId));
+        db.update("""
+                DELETE FROM service_resource_requirements req
+                USING resource_types rt
+                WHERE req.service_id=:id AND rt.id=req.resource_type_id
+                  AND rt.organization_id=:org AND rt.category<>'staff'
+                """, Map.of("id", serviceId, "org", org));
         for (var req : request.requirements()) {
+            if (staffTypes.contains(req.resourceTypeId())) continue;
             db.update("""
                     INSERT INTO service_resource_requirements
                         (service_id,resource_type,resource_type_id,quantity,min_capacity)
@@ -203,6 +394,14 @@ public class BackofficeService {
                     .addValue("type", req.resourceTypeId()).addValue("quantity", req.quantity())
                     .addValue("capacity", req.minCapacity()));
         }
+        Long nonStaffCount=db.queryForObject("""
+                SELECT count(*) FROM service_resource_requirements req
+                JOIN resource_types rt ON rt.id=req.resource_type_id
+                WHERE req.service_id=:id AND rt.organization_id=:org AND rt.category<>'staff' AND rt.active
+                """,p(org,serviceId),Long.class);
+        if (nonStaffCount==null || nonStaffCount!=1)
+            db.update("UPDATE services SET customer_can_choose_resource=false WHERE organization_id=:org AND id=:id",
+                    p(org,serviceId));
         return resourceRequirements(org, serviceId);
     }
 
@@ -265,8 +464,23 @@ public class BackofficeService {
 
     @Transactional
     public Object updateMember(long org, long id, BackofficeDto.MemberUpsert r) {
-        var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.displayName()).addValue("role", r.role() == null ? "worker" : r.role()).addValue("active", r.active()).addValue("manage",r.canManageBookings()).addValue("approve",r.canApproveOwnAbsence());
-        return one("update organization_members set display_name=:name,role=:role,active=:active,can_manage_bookings=COALESCE(CAST(:manage AS boolean),can_manage_bookings),can_approve_own_absence=COALESCE(CAST(:approve AS boolean),can_approve_own_absence) where organization_id=:org and id=:id and archived_at is null returning *", a.getValues());
+        var currentPermissions = one("""
+                SELECT can_manage_bookings,can_manage_own_bookings
+                FROM organization_members WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                """, p(org, id));
+        boolean canManageBookings = r.canManageBookings() == null
+                ? Boolean.TRUE.equals(currentPermissions.get("can_manage_bookings"))
+                : r.canManageBookings();
+        boolean canManageOwnBookings = r.canManageOwnBookings() == null
+                ? Boolean.TRUE.equals(currentPermissions.get("can_manage_own_bookings"))
+                : r.canManageOwnBookings();
+        if (canManageBookings && canManageOwnBookings)
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                    "A worker cannot manage both colleagues' bookings and only their own bookings");
+        var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.displayName()).addValue("role", r.role() == null ? "worker" : r.role()).addValue("active", r.active()).addValue("providesServices",r.providesServices()).addValue("manage",r.canManageBookings()).addValue("manageOwn",r.canManageOwnBookings()).addValue("approve",r.canApproveOwnAbsence());
+        var updated = one("update organization_members set display_name=:name,role=:role,active=:active,provides_services=COALESCE(CAST(:providesServices AS boolean),provides_services),can_manage_bookings=COALESCE(CAST(:manage AS boolean),can_manage_bookings),can_manage_own_bookings=COALESCE(CAST(:manageOwn AS boolean),can_manage_own_bookings),can_approve_own_absence=COALESCE(CAST(:approve AS boolean),can_approve_own_absence) where organization_id=:org and id=:id and archived_at is null returning *", a.getValues());
+        staffResourceService.synchronizeMember(org, id);
+        return updated;
     }
 
     @Transactional
@@ -299,6 +513,7 @@ public class BackofficeService {
                 SET active=false,archived_at=now()
                 WHERE organization_id=:org AND id=:id AND archived_at IS NULL
                 """, Map.of("org", org, "id", id));
+        staffResourceService.synchronizeMember(org, id);
     }
 
     public Object memberServices(long org, long id) {
@@ -348,12 +563,20 @@ public class BackofficeService {
 
     public Object reservation(long org, long id, Authentication authentication) {
         var head = one("select * from reservations where organization_id=:org and id=:id", p(org, id));
-        var items = db.queryForList("select * from reservation_items where organization_id=:org and reservation_id=:id order by starts_at", p(org, id));
+        var items = db.queryForList("""
+                SELECT ri.*,s.name AS service_name
+                FROM reservation_items ri
+                JOIN services s ON s.organization_id=ri.organization_id AND s.id=ri.service_id
+                WHERE ri.organization_id=:org AND ri.reservation_id=:id
+                ORDER BY ri.starts_at
+                """, p(org, id));
+        boolean canManage = organizationSecurity.canManageReservation(org, id, authentication);
         if (organizationSecurity.canManageBookings(org, authentication)) {
-            return Map.of("reservation", head, "items", items);
+            return Map.of("reservation", head, "items", items, "canManage", canManage);
         }
         var ownItems = db.queryForList("""
-                SELECT ri.* FROM reservation_items ri
+                SELECT ri.*,s.name AS service_name FROM reservation_items ri
+                JOIN services s ON s.organization_id=ri.organization_id AND s.id=ri.service_id
                 WHERE ri.organization_id=:org AND ri.reservation_id=:id AND (
                   EXISTS (SELECT 1 FROM organization_members m WHERE m.organization_id=ri.organization_id
                     AND m.id=ri.member_id AND m.user_id=:user AND m.active=true)
@@ -364,7 +587,7 @@ public class BackofficeService {
                     AND m.user_id=:user AND m.active=true)
                 ) ORDER BY ri.starts_at
                 """, Map.of("org",org,"id",id,"user",organizationSecurity.authenticatedUserId(authentication)));
-        return Map.of("reservation", head, "items", ownItems);
+        return Map.of("reservation", head, "items", ownItems, "canManage", canManage);
     }
 
     public Object schedule(long org, long id, Authentication authentication, java.time.LocalDate from, java.time.LocalDate to) {
@@ -771,14 +994,8 @@ public class BackofficeService {
     }
 
     @Transactional
-    public void deactivateOrganization(long org) {
-
-        int updated = db.update("""
-                UPDATE organizations
-                SET registration_status='suspended', booking_enabled=false
-                WHERE id=:org AND registration_status='active'
-                """, Map.of("org", org));
-        if (updated == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Active organization not found");
+    public void deleteOrganization(long org) {
+        organizationDeletionService.delete(org);
     }
 
     @Transactional
@@ -813,6 +1030,60 @@ public class BackofficeService {
         return paged("SELECT c.id,c.name,c.email,c.phone,c.notes", where, order, params, page, size);
     }
 
+    public Object bookingCustomers(long org, int page, int size, String q, String sort) {
+        var params = pageParams(page, size).addValue("org", org).addValue("q", contains(q));
+        String where = """
+                FROM (
+                    SELECT MIN(r.id) AS id,
+                           (array_agg(r.customer_name ORDER BY r.created_at DESC, r.id DESC))[1] AS name,
+                           NULLIF(lower(btrim(r.customer_email)), '') AS email,
+                           (array_agg(NULLIF(btrim(r.customer_phone), '') ORDER BY r.created_at DESC, r.id DESC)
+                               FILTER (WHERE NULLIF(btrim(r.customer_phone), '') IS NOT NULL))[1] AS phone,
+                           COUNT(*) AS reservation_count,
+                           MAX(r.created_at) AS last_reservation_at
+                    FROM reservations r
+                    WHERE r.organization_id=:org
+                    GROUP BY NULLIF(lower(btrim(r.customer_email)), ''),
+                             CASE WHEN NULLIF(lower(btrim(r.customer_email)), '') IS NULL THEN r.id END
+                ) c
+                WHERE (CAST(:q AS text) IS NULL OR c.name ILIKE :q ESCAPE '\\'
+                    OR COALESCE(c.email, '') ILIKE :q ESCAPE '\\'
+                    OR COALESCE(c.phone, '') ILIKE :q ESCAPE '\\')
+                """;
+        String order = sortOrder(sort, Map.of(
+                "id", "c.id", "name", "c.name", "email", "c.email",
+                "phone", "c.phone", "reservationCount", "c.reservation_count",
+                "lastReservationAt", "c.last_reservation_at"), "c.id");
+        return paged("""
+                SELECT c.id,c.name,c.email,c.phone,c.reservation_count,c.last_reservation_at
+                """, where, order, params, page, size);
+    }
+
+    public Object bookingCustomerReservations(long org, long id) {
+        var params = new MapSqlParameterSource().addValue("org", org).addValue("id", id);
+        var selected = db.queryForList("""
+                SELECT NULLIF(lower(btrim(customer_email)), '') AS email
+                FROM reservations
+                WHERE organization_id=:org AND id=:id
+                """, params);
+        if (selected.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Reservation not found");
+        Object email = selected.getFirst().get("email");
+        params.addValue("email", email);
+        var reservations = db.queryForList("""
+                SELECT r.id,r.customer_name,r.customer_email,r.customer_phone,r.status,
+                       r.total_amount,r.currency,r.created_at,
+                       (SELECT MIN(ri.starts_at) FROM reservation_items ri
+                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_at
+                FROM reservations r
+                WHERE r.organization_id=:org
+                  AND ((CAST(:email AS text) IS NULL AND r.id=:id)
+                    OR (CAST(:email AS text) IS NOT NULL
+                        AND NULLIF(lower(btrim(r.customer_email)), '')=:email))
+                ORDER BY appointment_at DESC NULLS LAST,r.created_at DESC,r.id DESC
+                """, params);
+        return reservations;
+    }
+
     @Transactional
     public Object createCustomer(long org, BackofficeDto.CreateCustomer r) {
         var a = new MapSqlParameterSource().addValue("org", org).addValue("name", r.name())
@@ -824,17 +1095,46 @@ public class BackofficeService {
     }
 
     public Object reservations(long org, Long locationId, Authentication authentication,
-            String status, java.time.OffsetDateTime from, java.time.OffsetDateTime to, int page, int size, String q, String sort) {
+            String status, boolean upcomingOnly, Long memberId, Long resourceId, java.time.OffsetDateTime from, java.time.OffsetDateTime to,
+            int page, int size, String q, String sort) {
         validatePeriod(from, to);
         if (locationId != null) location(org, locationId);
         var params = pageParams(page, size).addValue("org", org).addValue("loc", locationId)
-                .addValue("status", blankToNull(status)).addValue("from", from).addValue("to", to).addValue("q", contains(q));
+                .addValue("status", blankToNull(status)).addValue("upcomingOnly", upcomingOnly)
+                .addValue("member", memberId).addValue("resource", resourceId)
+                .addValue("from", from).addValue("to", to)
+                .addValue("q", searchTokens(q));
         String where = " FROM reservations r WHERE r.organization_id=:org "
                 + " AND (CAST(:loc AS bigint) IS NULL OR r.location_id=:loc) "
                 + " AND (CAST(:status AS text) IS NULL OR r.status=:status) "
+                + " AND (:upcomingOnly=false OR EXISTS (SELECT 1 FROM reservation_items future_item"
+                + " WHERE future_item.organization_id=r.organization_id AND future_item.reservation_id=r.id"
+                + " AND future_item.item_status='active' AND future_item.starts_at>now())) "
+                + " AND (CAST(:member AS bigint) IS NULL OR EXISTS ("
+                + " SELECT 1 FROM reservation_items ri WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id"
+                + " AND (ri.member_id=:member OR EXISTS (SELECT 1 FROM reservation_resources rr"
+                + " JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id"
+                + " JOIN resource_types rt ON rt.id=res.resource_type_id AND rt.organization_id=res.organization_id"
+                + " WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id"
+                + " AND rt.category='staff' AND res.member_id=:member)))) "
+                + " AND (CAST(:resource AS bigint) IS NULL OR EXISTS ("
+                + " SELECT 1 FROM reservation_items ri JOIN reservation_resources rr"
+                + " ON rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id"
+                + " JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id"
+                + " JOIN resource_types rt ON rt.organization_id=res.organization_id AND rt.id=res.resource_type_id"
+                + " WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id"
+                + " AND res.id=:resource AND rt.category<>'staff')) "
                 + " AND (CAST(:from AS timestamptz) IS NULL OR r.created_at >= CAST(:from AS timestamptz)) "
                 + " AND (CAST(:to AS timestamptz) IS NULL OR r.created_at < CAST(:to AS timestamptz)) ";
-        where += " AND (CAST(:q AS text) IS NULL OR r.customer_name ILIKE :q ESCAPE '\\' OR r.customer_email ILIKE :q ESCAPE '\\' OR r.customer_phone ILIKE :q ESCAPE '\\') ";
+        where += """
+                 AND (CAST(:q AS text[]) IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM unnest(CAST(:q AS text[])) AS search_token(value)
+                     WHERE NOT (
+                         r.customer_name ILIKE '%' || search_token.value || '%' ESCAPE '\\'
+                         OR COALESCE(r.customer_email,'') ILIKE '%' || search_token.value || '%' ESCAPE '\\'
+                     )
+                 ))
+                """;
         if (!organizationSecurity.canManageBookings(org, authentication)) {
             params.addValue("user", organizationSecurity.authenticatedUserId(authentication));
             where += " AND EXISTS (SELECT 1 FROM reservation_items ri "
@@ -847,7 +1147,43 @@ public class BackofficeService {
                     + " WHERE rr.reservation_item_id=ri.id AND rr.organization_id=ri.organization_id "
                     + " AND m.user_id=:user AND m.active=true))) ";
         }
-        return paged("SELECT r.id,r.customer_name,r.status,r.total_amount,r.currency,r.created_at",
+        return paged("""
+                SELECT r.id,r.customer_name,r.status,r.total_amount,r.currency,r.created_at,
+                       (SELECT MIN(ri.starts_at) FROM reservation_items ri
+                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_at,
+                       (SELECT MAX(ri.ends_at) FROM reservation_items ri
+                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_ends_at,
+                       (SELECT string_agg(worker_names.display_name, ', ' ORDER BY worker_names.display_name)
+                        FROM (
+                          SELECT m.display_name
+                          FROM reservation_items worker_item
+                          JOIN organization_members m ON m.organization_id=worker_item.organization_id
+                            AND m.id=worker_item.member_id
+                          WHERE worker_item.organization_id=r.organization_id
+                            AND worker_item.reservation_id=r.id AND worker_item.member_id IS NOT NULL
+                          UNION
+                          SELECT assigned.display_name
+                          FROM reservation_items assigned_item
+                          JOIN reservation_resources rr ON rr.organization_id=assigned_item.organization_id
+                            AND rr.reservation_item_id=assigned_item.id
+                          JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id
+                          JOIN resource_types rt ON rt.organization_id=res.organization_id
+                            AND rt.id=res.resource_type_id AND rt.category='staff'
+                          JOIN organization_members assigned ON assigned.organization_id=res.organization_id
+                            AND assigned.id=res.member_id
+                          WHERE assigned_item.organization_id=r.organization_id
+                            AND assigned_item.reservation_id=r.id AND res.member_id IS NOT NULL
+                        ) worker_names) AS member_name,
+                       (SELECT string_agg(DISTINCT res.name, ', ' ORDER BY res.name)
+                        FROM reservation_items resource_item
+                        JOIN reservation_resources rr ON rr.organization_id=resource_item.organization_id
+                          AND rr.reservation_item_id=resource_item.id
+                        JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id
+                        JOIN resource_types rt ON rt.organization_id=res.organization_id
+                          AND rt.id=res.resource_type_id AND rt.category<>'staff'
+                        WHERE resource_item.organization_id=r.organization_id
+                          AND resource_item.reservation_id=r.id) AS resource_name
+                """,
                 where, sortOrder(sort, Map.of("id", "r.id", "createdAt", "r.created_at", "status", "r.status", "customerName", "r.customer_name"), "r.id"), params, page, size);
     }
 
@@ -860,7 +1196,7 @@ public class BackofficeService {
                 + " AND (CAST(:name AS text) IS NULL OR m.display_name ILIKE :name ESCAPE '\\') "
                 + " AND (CAST(:role AS text) IS NULL OR m.role=:role) ";
         where += " AND (CAST(:q AS text) IS NULL OR m.display_name ILIKE :q ESCAPE '\\' OR m.role ILIKE :q ESCAPE '\\' OR u.email ILIKE :q ESCAPE '\\') ";
-        return paged("SELECT m.id,m.user_id,u.email,m.display_name,m.role,m.active,m.can_manage_bookings,m.can_approve_own_absence", where,
+        return paged("SELECT m.id,m.user_id,u.email,m.display_name,m.role,m.active,m.provides_services,m.can_manage_bookings,m.can_manage_own_bookings,m.can_approve_own_absence", where,
                 sortOrder(sort, Map.of("id", "m.id", "name", "m.display_name", "role", "m.role", "active", "m.active"), "m.id"), params, page, size);
     }
 
@@ -931,6 +1267,16 @@ public class BackofficeService {
         if (cleaned == null) return null;
         return "%" + cleaned.replace("\\", "\\\\").replace("%", "\\%")
                 .replace("_", "\\_") + "%";
+    }
+
+    private static String[] searchTokens(String value) {
+        String cleaned = blankToNull(value);
+        if (cleaned == null) return null;
+        return java.util.Arrays.stream(cleaned.split("\\s+"))
+                .filter(token -> !token.isBlank())
+                .map(token -> token.replace("\\", "\\\\").replace("%", "\\%")
+                        .replace("_", "\\_"))
+                .toArray(String[]::new);
     }
 
     private static void validatePeriod(java.time.OffsetDateTime from, java.time.OffsetDateTime to) {

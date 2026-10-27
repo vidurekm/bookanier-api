@@ -61,6 +61,13 @@ public class AuthController {
         return service.changePassword(authentication, request);
     }
 
+    @org.springframework.web.bind.annotation.DeleteMapping("/me")
+    @org.springframework.web.bind.annotation.ResponseStatus(org.springframework.http.HttpStatus.NO_CONTENT)
+    @Operation(summary = "Delete current account", description = "Permanently delete the authenticated account and organizations it owns.")
+    public void deleteAccount(Authentication authentication) {
+        service.deleteAccount(authentication);
+    }
+
     @PostMapping("/email/confirm")
     public java.util.Map<String,String> confirmEmailChange(@Valid @RequestBody AccountDto.ConfirmEmail request) {
         return service.confirmEmailChange(request);

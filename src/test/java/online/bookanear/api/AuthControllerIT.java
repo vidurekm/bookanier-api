@@ -14,6 +14,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -84,6 +85,48 @@ class AuthControllerIT extends PostgresIntegrationTest {
         mvc.perform(post(LOGIN).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"email\":\"invalid\",\"password\":\"\"}"))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void accountDeletionRemovesOwnedOrganizationsAndPreservesOtherOrganizations() throws Exception {
+        long userId = insertUser("delete@example.com", "correct-password", true);
+        long ownedOrganization = db.queryForObject(
+                "INSERT INTO organizations(name) VALUES ('Owned organization') RETURNING id", java.util.Map.of(), Long.class);
+        long otherOrganization = db.queryForObject(
+                "INSERT INTO organizations(name) VALUES ('Other organization') RETURNING id", java.util.Map.of(), Long.class);
+        db.update("""
+                INSERT INTO organization_members(organization_id,user_id,display_name,role)
+                VALUES (:org,:user,'Test User','owner')
+                """, new MapSqlParameterSource().addValue("org", ownedOrganization).addValue("user", userId));
+        db.update("""
+                INSERT INTO organization_members(organization_id,user_id,display_name,role)
+                VALUES (:org,:user,'Test User','worker')
+                """, new MapSqlParameterSource().addValue("org", otherOrganization).addValue("user", userId));
+
+        String loginBody = mvc.perform(post(LOGIN)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"delete@example.com","password":"correct-password"}
+                                """))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        String token = mapper.readTree(loginBody).get("accessToken").asText();
+
+        mvc.perform(delete("/api/v1/auth/me").header("Authorization", "Bearer " + token))
+                .andExpect(status().isNoContent());
+
+        assertThat(db.queryForObject("SELECT count(*) FROM users WHERE id=:id",
+                java.util.Map.of("id", userId), Integer.class)).isZero();
+        assertThat(db.queryForObject("SELECT count(*) FROM organizations WHERE id=:id",
+                java.util.Map.of("id", ownedOrganization), Integer.class)).isZero();
+        assertThat(db.queryForObject("SELECT count(*) FROM organizations WHERE id=:id",
+                java.util.Map.of("id", otherOrganization), Integer.class)).isEqualTo(1);
+        var preservedMembership = db.queryForMap("""
+                SELECT user_id,active FROM organization_members
+                WHERE organization_id=:org
+                """, java.util.Map.of("org", otherOrganization));
+        assertThat(preservedMembership.get("user_id")).isNull();
+        assertThat(preservedMembership.get("active")).isEqualTo(false);
     }
 
     @Test

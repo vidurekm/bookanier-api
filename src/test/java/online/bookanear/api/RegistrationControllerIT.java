@@ -8,6 +8,7 @@ import org.springframework.mail.MailSendException;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import online.bookanear.api.dto.RegistrationDto;
@@ -16,6 +17,7 @@ import online.bookanear.api.service.RegistrationService;
 import java.util.Map;
 import java.util.regex.Pattern;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
@@ -37,6 +39,7 @@ class RegistrationControllerIT extends PostgresIntegrationTest {
 
     @Autowired MockMvc mvc;
     @Autowired RegistrationService registrationService;
+    @Autowired ObjectMapper objectMapper;
 
     private String registerAndGetToken() throws Exception {
         mvc.perform(post(REGISTER).contentType(MediaType.APPLICATION_JSON)
@@ -139,6 +142,48 @@ class RegistrationControllerIT extends PostgresIntegrationTest {
                 .andExpect(status().isConflict());
         assertThat(db.queryForObject("SELECT COUNT(*) FROM users", Map.of(), Integer.class)).isEqualTo(1);
         assertThat(db.queryForObject("SELECT COUNT(*) FROM organizations", Map.of(), Integer.class)).isEqualTo(1);
+    }
+
+    @Test
+    void existingAuthenticatedUserCanCreateAnotherOrganizationWithoutCreatingAnAccount() throws Exception {
+        String verificationToken = registerAndGetToken();
+        mvc.perform(post(REGISTER + "/verify").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"token\":\"" + verificationToken + "\"}"))
+                .andExpect(status().isOk());
+        MvcResult login = mvc.perform(post("/api/v1/auth/login").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"owner@example.com","password":"a-long-strong-password"}
+                                """))
+                .andExpect(status().isOk())
+                .andReturn();
+        String accessToken = objectMapper.readTree(login.getResponse().getContentAsString())
+                .get("accessToken").asText();
+
+        mvc.perform(post("/api/v1/backoffice/organizations")
+                        .header("Authorization", "Bearer " + accessToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"Second Studio\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").isNumber())
+                .andExpect(jsonPath("$.name").value("Second Studio"));
+
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM users", Map.of(), Integer.class)).isEqualTo(1);
+        assertThat(db.queryForObject("SELECT COUNT(*) FROM organizations", Map.of(), Integer.class)).isEqualTo(2);
+        assertThat(db.queryForObject("""
+                SELECT COUNT(*) FROM organization_members m
+                JOIN organizations o ON o.id=m.organization_id
+                WHERE m.role='owner' AND m.user_id=(SELECT id FROM users WHERE email='owner@example.com')
+                  AND o.name='Second Studio'
+                """, Map.of(), Integer.class)).isEqualTo(1);
+        assertThat(db.queryForObject("""
+                SELECT COUNT(*) FROM organizations
+                WHERE name='Second Studio' AND registration_status='active'
+                  AND verified_at IS NOT NULL AND booking_enabled
+                """, Map.of(), Integer.class)).isEqualTo(1);
+        assertThat(db.queryForObject("""
+                SELECT COUNT(*) FROM organization_booking_config c
+                JOIN organizations o ON o.id=c.organization_id WHERE o.name='Second Studio'
+                """, Map.of(), Integer.class)).isEqualTo(1);
     }
 
     @Test

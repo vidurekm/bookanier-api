@@ -55,10 +55,25 @@ class SetupDraftValidationTest {
         assertThatThrownBy(() -> service.validate(duplicateEmails, true)).isInstanceOf(ApiException.class);
     }
 
+    @Test
+    void workerCannotManageColleagueBookingsAndOwnBookingsAtTheSameTime() {
+        var draft = salon("Anna", "Stříhání");
+        var member = new SetupDto.MemberInput("Anna", List.of(0), true,
+                true, true, false, "anna@example.com");
+        var conflicting = new SetupDto.Draft(draft.templateKey(), draft.multiLocation(),
+                draft.locations(), List.of(member), draft.services(), draft.trackResources(),
+                draft.resourceCount(), draft.resourceCapacity(), draft.resourceName(),
+                draft.customerSelectResource(), draft.showStaffChoice(), draft.useWaitlist(),
+                draft.eventCapacity(), draft.workingStart(), draft.workingEnd(),
+                draft.ownerProvidesServices(), draft.ownerLocationIndex(), draft.openingHours());
+        assertThatThrownBy(() -> service.validate(conflicting, false))
+                .isInstanceOf(ApiException.class);
+    }
+
     private static SetupDto.Draft withMemberEmail(SetupDto.Draft draft, String email) {
         var old = draft.members().getFirst();
         var member = new SetupDto.MemberInput(old.name(), old.locationIndexes(), old.providesServices(),
-                old.canManageBookings(), old.canApproveOwnAbsence(), email);
+                old.canManageBookings(), old.canManageOwnBookings(), old.canApproveOwnAbsence(), email);
         return new SetupDto.Draft(draft.templateKey(), draft.multiLocation(), draft.locations(),
                 List.of(member), draft.services(), draft.trackResources(), draft.resourceCount(),
                 draft.resourceCapacity(), draft.resourceName(), draft.customerSelectResource(),

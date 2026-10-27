@@ -195,9 +195,18 @@ public class MediaService {
                     " WHERE organization_id=:org AND media_id=:media", Map.of("org", org, "media", mediaId), Integer.class);
             if (refs != null && refs > 0) throw new ApiException(HttpStatus.CONFLICT, "Detach image from all objects first");
         }
+
         storage.delete((String) a.get("storage_key"));
         db.update("DELETE FROM media_assets WHERE organization_id=:org AND id=:media",
                 Map.of("org", org, "media", mediaId));
+    }
+
+    public void deleteOrganizationAssets(long org) {
+        var assets = db.queryForList("SELECT storage_key FROM media_assets WHERE organization_id=:org",
+                Map.of("org", org));
+        for (var asset : assets) {
+            storage.delete((String) asset.get("storage_key"));
+        }
     }
 
     private Map<String, Object> asset(long org, long id) {

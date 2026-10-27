@@ -17,6 +17,8 @@ mvn spring-boot:run
 
 When running locally, Spring loads the ignored `bookanear-api/.env.local` file. It contains the local configuration defaults and must be updated with valid database and SMTP settings. Docker Compose uses `.env` instead. Flyway applies pending migrations at startup. Health: `GET http://localhost:8080/actuator/health`.
 
+The optional in-app help assistant uses the OpenAI API. Set `OPENAI_API_KEY` in `.env.local` for local runs or `.env` for Docker Compose; `OPENAI_MODEL` defaults to `gpt-4o-mini`. Keep the key server-side and out of source control. The assistant sends chat messages to OpenAI, does not receive organization data, and is restricted by its instructions to Bookanear usage help.
+
 To empty all application tables without removing the schema or Flyway migration history, open `scripts/clean-database.sql` in DBeaver, replace `REPLACE_WITH_DATABASE_NAME` with the exact target database name shown in DBeaver, then execute the script. It refuses to run if the placeholder was not changed or the active connection is to a different database:
 
 This permanently deletes application data and resets table identity sequences. `CASCADE` also clears tables connected by foreign keys. It does not run migrations or remove `flyway_schema_history`.

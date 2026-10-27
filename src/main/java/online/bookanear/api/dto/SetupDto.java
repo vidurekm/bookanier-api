@@ -12,30 +12,49 @@ public final class SetupDto {
         }
     }
     // Null for previously saved drafts means bookable (backwards compatibility).
-    public record MemberInput(@NotBlank String name, List<@Min(0) Integer> locationIndexes, Boolean providesServices, Boolean canManageBookings, Boolean canApproveOwnAbsence, String email) {
+    public record MemberInput(@NotBlank String name, List<@Min(0) Integer> locationIndexes, Boolean providesServices, Boolean canManageBookings, Boolean canManageOwnBookings, Boolean canApproveOwnAbsence, String email) {
         public MemberInput(String name, List<Integer> locationIndexes, Boolean providesServices) {
-            this(name, locationIndexes, providesServices, null, null, null);
+            this(name, locationIndexes, providesServices, null, null, null, null);
         }
         public MemberInput(String name, List<Integer> locationIndexes, Boolean providesServices,
                            Boolean canManageBookings, Boolean canApproveOwnAbsence) {
-            this(name, locationIndexes, providesServices, canManageBookings, canApproveOwnAbsence, null);
+            this(name, locationIndexes, providesServices, canManageBookings, null, canApproveOwnAbsence, null);
+        }
+        public MemberInput(String name, List<Integer> locationIndexes, Boolean providesServices,
+                           Boolean canManageBookings, Boolean canApproveOwnAbsence, String email) {
+            this(name, locationIndexes, providesServices, canManageBookings, null, canApproveOwnAbsence, email);
+        }
+        public MemberInput(String name, List<Integer> locationIndexes, Boolean providesServices,
+                           Boolean canManageBookings, Boolean canManageOwnBookings, Boolean canApproveOwnAbsence) {
+            this(name, locationIndexes, providesServices, canManageBookings, canManageOwnBookings,
+                    canApproveOwnAbsence, null);
         }
     }
     public record ServiceInput(@NotBlank String name, @Min(5) @Max(1440) int durationMinutes,
-                               @NotNull @DecimalMin("0") BigDecimal price, @NotBlank String currency) {}
+                               @NotNull @DecimalMin("0") BigDecimal price, @NotBlank String currency,
+                               Boolean customerCanChooseStaff, Boolean customerCanChooseResource,
+                               @Min(1) @Max(100) Integer requiredStaffCount) {
+        public ServiceInput(String name, int durationMinutes, BigDecimal price, String currency) {
+            this(name, durationMinutes, price, currency, null, null, null);
+        }
+    }
     public record OpeningIntervalInput(@Min(0) int locationIndex, @Min(1) @Max(7) int weekday,
                                        String start, String end) {}
     public record Options(boolean customerSelectResource, boolean showStaffChoice,
                           @Min(1) @Max(10000) int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat,
-                          @Min(1) @Max(3650) Integer maxAdvanceDays) {
+                          @Min(1) @Max(3650) Integer maxAdvanceDays, Boolean trackResources) {
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, null, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, null, null, null);
         }
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, null, null);
+        }
+        public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat,
+                       @Min(1) @Max(3650) Integer maxAdvanceDays) {
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, maxAdvanceDays, null);
         }
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, null, null, null, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, null, null, null, null, null);
         }
     }
     public record Draft(

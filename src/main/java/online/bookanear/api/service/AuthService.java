@@ -47,14 +47,17 @@ public class AuthService {
     private final long expirationMinutes;
     private final String frontendUrl;
     private final String fromEmail;
+    private final OrganizationDeletionService organizationDeletionService;
     private final SecureRandom secureRandom = new SecureRandom();
     public AuthService(NamedParameterJdbcTemplate db, JwtEncoder jwtEncoder, JavaMailSender mailSender,
         @Value("${app.security.jwt.issuer}") String issuer,
         @Value("${app.security.jwt.expiration-minutes:30}") long expirationMinutes,
         @Value("${registration.home-url:http://localhost:5173/}") String frontendUrl,
-        @Value("${registration.from-email}") String fromEmail) {
+        @Value("${registration.from-email}") String fromEmail,
+        OrganizationDeletionService organizationDeletionService) {
         this.db=db; this.jwtEncoder=jwtEncoder; this.mailSender=mailSender; this.issuer=issuer;
         this.expirationMinutes=expirationMinutes; this.frontendUrl=FrontendLinks.base(frontendUrl); this.fromEmail=fromEmail;
+        this.organizationDeletionService=organizationDeletionService;
     }
     private static ResponseStatusException invalidCredentials() {
         return new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid email or password");
@@ -138,6 +141,32 @@ public class AuthService {
                 Map.of("name",request.name().trim(),"id",userId));
         if(updated!=1) throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"Authentication required");
         return currentUser(authentication);
+    }
+
+    @Transactional
+    public void deleteAccount(Authentication authentication) {
+        long userId = authenticatedUserId(authentication);
+        var ownedOrganizations = db.queryForList("""
+                SELECT DISTINCT organization_id
+                FROM organization_members
+                WHERE user_id=:user AND role='owner'
+                """, Map.of("user", userId));
+        for (var organization : ownedOrganizations) {
+            long organizationId = ((Number) organization.get("organization_id")).longValue();
+            organizationDeletionService.delete(organizationId);
+        }
+
+        db.update("UPDATE organization_members SET user_id=NULL, active=false WHERE user_id=:user",
+                Map.of("user", userId));
+        db.update("UPDATE customers SET user_id=NULL WHERE user_id=:user", Map.of("user", userId));
+        db.update("UPDATE member_absence_requests SET requested_by=NULL WHERE requested_by=:user",
+                Map.of("user", userId));
+        db.update("UPDATE member_absence_requests SET decided_by=NULL WHERE decided_by=:user",
+                Map.of("user", userId));
+        db.update("UPDATE reservation_events SET actor_user_id=NULL WHERE actor_user_id=:user",
+                Map.of("user", userId));
+        int deleted = db.update("DELETE FROM users WHERE id=:user", Map.of("user", userId));
+        if (deleted != 1) throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required");
     }
 
     private static String digest(String raw) {

@@ -13,8 +13,14 @@ public final class InvitationDto {
             @NotBlank @Size(max = 200) String displayName,
             @Pattern(regexp = "owner|admin|worker") String role,
             Boolean canManageBookings,
+            Boolean canManageOwnBookings,
             Boolean canApproveOwnAbsence,
-            @jakarta.validation.constraints.Positive Long memberId) {}
+            @jakarta.validation.constraints.Positive Long memberId) {
+        public CreateRequest(String email, String displayName, String role, Boolean canManageBookings,
+                             Boolean canApproveOwnAbsence, Long memberId) {
+            this(email, displayName, role, canManageBookings, null, canApproveOwnAbsence, memberId);
+        }
+    }
 
     public record AcceptRequest(
             @NotBlank @Pattern(regexp = "[A-Za-z0-9_-]{32,128}") String token,

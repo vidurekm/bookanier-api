@@ -16,6 +16,10 @@ public final class BackofficeDto {
     public record CreateOrganization(@Schema(description = "Organization display name.", example = "Example Studio") @NotBlank String name, @Schema(description = "URL-friendly organization identifier.", example = "example-studio") @NotBlank String slug, @Schema(description = "Organization contact email.", example = "hello@example.com") @Email(regexp = EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY) String email) {
     }
 
+    @Schema(description = "New organization created by the authenticated user.")
+    public record OrganizationCreate(@Schema(description = "Organization display name.", example = "Example Studio") @NotBlank @Size(max = 200) String name) {
+    }
+
     @Schema(description = "New organization location.")
     public record CreateLocation(@Schema(description = "Location display name.", example = "Main branch") @NotBlank String name, @Schema(description = "IANA time-zone identifier.", example = "Europe/Prague") @NotBlank String timezone, @Schema(description = "Location address.", example = "Prague, Czechia") String address, Double latitude, Double longitude) {
         public CreateLocation(String name, String timezone, String address) {
@@ -97,9 +101,9 @@ public final class BackofficeDto {
 
     @Schema(description = "Editable organization member role and status.")
     public record MemberUpsert(@Schema(description = "Member display name.", example = "Alex Smith") @NotBlank String displayName, @Schema(description = "Organization role: owner, admin or worker.", example = "worker") @Pattern(regexp = "owner|admin|worker") String role, @Schema(description = "Whether the member is active.", example = "true") boolean active,
-        Boolean canManageBookings, Boolean canApproveOwnAbsence) {
+        Boolean providesServices, Boolean canManageBookings, Boolean canManageOwnBookings, Boolean canApproveOwnAbsence) {
         public MemberUpsert(String displayName, String role, boolean active) {
-            this(displayName,role,active,null,null);
+            this(displayName,role,active,null,null,null,null);
         }
     }
 
@@ -132,5 +136,8 @@ public final class BackofficeDto {
             @NotNull @Min(1) Integer quantity, @Min(1) Integer minCapacity) {}
 
     public record ResourceRequirements(@NotNull java.util.List<@Valid ResourceRequirement> requirements) {}
+
+    public record ServiceBookingOptions(@NotNull Boolean customerCanChooseStaff,
+            @NotNull Boolean customerCanChooseResource, @NotNull @Min(1) @Max(100) Integer requiredStaffCount) {}
 
 }

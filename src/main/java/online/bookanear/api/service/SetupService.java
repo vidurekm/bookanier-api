@@ -116,6 +116,9 @@ public class SetupService {
         if(draft.members()!=null) for(var m:draft.members()) {
             if(m==null || m.name()==null || (finalSubmission && m.name().isBlank()))
                 throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Invalid worker name");
+            if (Boolean.TRUE.equals(m.canManageBookings()) && Boolean.TRUE.equals(m.canManageOwnBookings()))
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR",
+                        "A worker cannot manage both colleagues' bookings and only their own bookings");
             if(finalSubmission && (m.email()==null || !m.email().trim().matches(EmailRules.WITH_DOMAIN_SUFFIX_OR_EMPTY)
                     || m.email().isBlank()))
                 throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","A valid email is required for every team member");
@@ -132,6 +135,9 @@ public class SetupService {
         if(draft.services()!=null) for(var service:draft.services()) {
             if(service==null || service.name()==null || (finalSubmission && service.name().isBlank()))
                 throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Invalid service");
+            int staffCount = service.requiredStaffCount() == null ? 1 : service.requiredStaffCount();
+            if (staffCount < 1 || staffCount > 100)
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Staff count must be between 1 and 100");
             // In-progress placeholder services have no name yet; validate their
             // other fields when they become real services or on final submit.
             if((finalSubmission || !service.name().isBlank()) &&
@@ -178,9 +184,9 @@ public class SetupService {
         if(current.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND,"NOT_FOUND","Configuration missing");
         if(!"complete".equals(current.getFirst().get("setup_status")))
             throw new ApiException(HttpStatus.CONFLICT,"CONFLICT","Finish setup first");
-        Long resources=db.queryForObject("SELECT count(*) FROM resources WHERE organization_id=:org AND active",Map.of("org",org),Long.class);
-        if(options.customerSelectResource() && (resources==null || resources==0))
-            throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","No resources to select");
+        String model = Objects.toString(current.getFirst().get("booking_model"), "");
+        if (("RESOURCE".equals(model) || "RENTAL".equals(model)) && Boolean.FALSE.equals(options.trackResources()))
+            throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","This booking model requires resource tracking");
         var settingArgs=new MapSqlParameterSource().addValue("org",org)
                 .addValue("select",options.customerSelectResource())
                 .addValue("staff",options.showStaffChoice())
@@ -200,6 +206,15 @@ public class SetupService {
               'maxAdvanceDays',CAST(COALESCE(:advanceDays,COALESCE((settings->>'maxAdvanceDays')::integer,180)) AS integer)),updated_at=now()
             WHERE organization_id=:org
             """,settingArgs);
+        if (options.trackResources() != null) {
+            db.update("""
+                UPDATE organization_booking_config
+                SET settings=jsonb_set(settings,'{trackResources}',to_jsonb(CAST(:trackResources AS boolean)),true),
+                    updated_at=now()
+                WHERE organization_id=:org
+                """, new MapSqlParameterSource().addValue("org",org)
+                    .addValue("trackResources",options.trackResources(),java.sql.Types.BOOLEAN));
+        }
         return config(org);
     }
     @Transactional
@@ -242,8 +257,8 @@ public class SetupService {
         var memberBranches=new HashMap<Long,List<Integer>>();
         var invitationMembers=new ArrayList<Map.Entry<Long,SetupDto.MemberInput>>();
         if(draft.members()!=null) for(var m:draft.members()) {
-            Long mid=db.queryForObject("INSERT INTO organization_members(organization_id,display_name,role,can_manage_bookings,can_approve_own_absence) VALUES(:org,:name,'worker',:manage,:approve) RETURNING id",
-                Map.of("org",org,"name",m.name().trim(),"manage",Boolean.TRUE.equals(m.canManageBookings()),"approve",Boolean.TRUE.equals(m.canApproveOwnAbsence())),Long.class);
+            Long mid=db.queryForObject("INSERT INTO organization_members(organization_id,display_name,role,provides_services,can_manage_bookings,can_manage_own_bookings,can_approve_own_absence) VALUES(:org,:name,'worker',:provides,:manage,:manageOwn,:approve) RETURNING id",
+                Map.of("org",org,"name",m.name().trim(),"provides",offersServices(m),"manage",Boolean.TRUE.equals(m.canManageBookings()),"manageOwn",Boolean.TRUE.equals(m.canManageOwnBookings()),"approve",Boolean.TRUE.equals(m.canApproveOwnAbsence())),Long.class);
             invitationMembers.add(Map.entry(mid,m));
             List<Integer> selected = new ArrayList<>();
             // One primary branch at onboarding: avoid assigning identical worker shifts
@@ -263,11 +278,16 @@ public class SetupService {
         }
         if(draft.ownerProvidesServices() && "APPOINTMENT".equals(model)) {
             long ownerId=((Number)((Map<?,?>)owner(org)).get("id")).longValue();
+            db.update("UPDATE organization_members SET provides_services=true WHERE organization_id=:org AND id=:owner",
+                Map.of("org",org,"owner",ownerId));
             int li=draft.ownerLocationIndex();
             db.update("INSERT INTO member_locations(organization_id,member_id,location_id) VALUES(:org,:mid,:loc) ON CONFLICT(member_id,location_id) DO NOTHING",
                 Map.of("org",org,"mid",ownerId,"loc",locIds.get(li)));
             memberIds.add(ownerId);
             memberBranches.put(ownerId,List.of(li));
+        } else {
+            db.update("UPDATE organization_members SET provides_services=false WHERE organization_id=:org AND id=:owner",
+                Map.of("org",org,"owner",((Number)((Map<?,?>)owner(org)).get("id")).longValue()));
         }
         Long equipmentType=null;
         Long staffType=null;
@@ -308,10 +328,24 @@ public class SetupService {
             }
         }
         if(!"EVENT".equals(model) && draft.services()!=null) for(var s:draft.services()) {
-            Long sid=db.queryForObject("INSERT INTO services(organization_id,name) VALUES(:org,:name) RETURNING id",Map.of("org",org,"name",s.name().trim()),Long.class);
+            boolean wantsStaffChoice = s.customerCanChooseStaff() == null
+                    ? staffType != null && draft.showStaffChoice() : s.customerCanChooseStaff();
+            boolean wantsResourceChoice = s.customerCanChooseResource() == null
+                    ? equipmentType != null && draft.customerSelectResource() : s.customerCanChooseResource();
+            if (wantsStaffChoice && staffType == null)
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Staff choice requires a bookable team member");
+            if (wantsResourceChoice && equipmentType == null)
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Resource choice requires a tracked resource");
+            boolean canChooseStaff = wantsStaffChoice;
+            boolean canChooseResource = wantsResourceChoice;
+            int staffCount = s.requiredStaffCount() == null ? 1 : s.requiredStaffCount();
+            Long sid=db.queryForObject("""
+                    INSERT INTO services(organization_id,name,customer_can_choose_staff,customer_can_choose_resource)
+                    VALUES(:org,:name,:staffChoice,:resourceChoice) RETURNING id
+                    """,Map.of("org",org,"name",s.name().trim(),"staffChoice",canChooseStaff,"resourceChoice",canChooseResource),Long.class);
             db.update("INSERT INTO service_versions(service_id,valid_during,duration_minutes,slot_interval_minutes,price,currency,duration_mode,max_duration_minutes) VALUES(:sid,daterange(current_date,NULL,'[)'),:duration,15,:price,:currency,:mode,:max)",
                 new MapSqlParameterSource().addValue("sid",sid).addValue("duration",s.durationMinutes()).addValue("price",s.price()).addValue("currency",s.currency().trim().toUpperCase(Locale.ROOT)).addValue("mode","RENTAL".equals(model)?"CUSTOM":"FIXED").addValue("max","RENTAL".equals(model)?43200:null));
-            if(staffType!=null) db.update("INSERT INTO service_resource_requirements(service_id,resource_type,resource_type_id,quantity,min_capacity) VALUES(:sid,'staff',:type,1,NULL)",Map.of("sid",sid,"type",staffType));
+            if(staffType!=null) db.update("INSERT INTO service_resource_requirements(service_id,resource_type,resource_type_id,quantity,min_capacity) VALUES(:sid,'staff',:type,:quantity,NULL)",Map.of("sid",sid,"type",staffType,"quantity",staffCount));
             if(equipmentType!=null) db.update("INSERT INTO service_resource_requirements(service_id,resource_type,resource_type_id,quantity,min_capacity) VALUES(:sid,:code,:type,1,NULL)",Map.of("sid",sid,"code",resourceTypeCode(equipmentType),"type",equipmentType));
             for(var loc:locIds) db.update("INSERT INTO location_services(organization_id,location_id,service_id) VALUES(:org,:loc,:sid)",Map.of("org",org,"loc",loc,"sid",sid));
             for(var mid:memberIds) db.update("INSERT INTO worker_services(organization_id,member_id,service_id) VALUES(:org,:mid,:sid)",Map.of("org",org,"mid",mid,"sid",sid));
@@ -323,7 +357,7 @@ public class SetupService {
                 var member = entry.getValue();
                 invitationService.create(org, new InvitationDto.CreateRequest(
                         member.email(), member.name(), "worker", member.canManageBookings(),
-                        member.canApproveOwnAbsence(), entry.getKey()));
+                        member.canManageOwnBookings(), member.canApproveOwnAbsence(), entry.getKey()));
             }
         }
         return config(org);

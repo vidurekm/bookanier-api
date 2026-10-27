@@ -197,6 +197,41 @@ class BackofficeArchiveIT extends PostgresIntegrationTest {
     }
 
     @Test
+    void groupsBookingCustomersByNormalizedEmailAndKeepsMissingEmailsSeparate() {
+        long org = id("INSERT INTO organizations(name) VALUES('Booking customer grouping test') RETURNING id", Map.of());
+        long location = id("""
+                INSERT INTO locations(organization_id,name,timezone)
+                VALUES(:org,'Branch','Europe/Prague') RETURNING id
+                """, Map.of("org", org));
+        long first = id("""
+                INSERT INTO reservations(organization_id,location_id,customer_name,customer_email,status,total_amount)
+                VALUES(:org,:location,'Jane',' Jane@Example.test ','confirmed',10) RETURNING id
+                """, Map.of("org", org, "location", location));
+        id("""
+                INSERT INTO reservations(organization_id,location_id,customer_name,customer_email,status,total_amount)
+                VALUES(:org,:location,'Jane Smith','jane@example.TEST','confirmed',20) RETURNING id
+                """, Map.of("org", org, "location", location));
+        long noEmail = id("""
+                INSERT INTO reservations(organization_id,location_id,customer_name,status,total_amount)
+                VALUES(:org,:location,'Guest','confirmed',0) RETURNING id
+                """, Map.of("org", org, "location", location));
+        id("""
+                INSERT INTO reservations(organization_id,location_id,customer_name,customer_email,status,total_amount)
+                VALUES(:org,:location,'Guest','   ','confirmed',0) RETURNING id
+                """, Map.of("org", org, "location", location));
+
+        Map<?, ?> result = (Map<?, ?>) service.bookingCustomers(org, 0, 100, null, "email,asc");
+        var items = (java.util.List<?>) result.get("items");
+        assertThat(items).hasSize(3);
+        Map<?, ?> emailCustomer = items.stream().map(Map.class::cast)
+                .filter(customer -> "jane@example.test".equals(customer.get("email"))).findFirst().orElseThrow();
+        assertThat(emailCustomer.get("id")).isEqualTo(first);
+        assertThat(((Number) emailCustomer.get("reservation_count")).intValue()).isEqualTo(2);
+        assertThat(((java.util.List<?>) service.bookingCustomerReservations(org, first))).hasSize(2);
+        assertThat(((java.util.List<?>) service.bookingCustomerReservations(org, noEmail))).hasSize(1);
+    }
+
+    @Test
     void createsCustomerWithInternalNote() {
         long org = id("INSERT INTO organizations(name) VALUES('Customer note test') RETURNING id", Map.of());
 

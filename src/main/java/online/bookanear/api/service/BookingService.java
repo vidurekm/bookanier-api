@@ -79,7 +79,7 @@ public class BookingService {
     }
 
     private Map<String, Object> context(long org, long loc, long member, long service) {
-        var rows = db.queryForList("select l.timezone from organizations o join locations l on l.organization_id=o.id and l.id=:loc join organization_members m on m.organization_id=o.id and m.id=:member join member_locations ml on ml.member_id=m.id and ml.location_id=l.id join services s on s.organization_id=o.id and s.id=:svc join worker_services ws on ws.member_id=m.id and ws.service_id=s.id and ws.active join location_services ls on ls.location_id=l.id and ls.service_id=s.id and ls.active where o.id=:org and o.booking_enabled and l.active and l.archived_at is null and m.active and m.archived_at is null and s.active", Map.of("org", org, "loc", loc, "member", member, "svc", service));
+        var rows = db.queryForList("select l.timezone from organizations o join locations l on l.organization_id=o.id and l.id=:loc join organization_members m on m.organization_id=o.id and m.id=:member join member_locations ml on ml.member_id=m.id and ml.location_id=l.id join services s on s.organization_id=o.id and s.id=:svc join worker_services ws on ws.member_id=m.id and ws.service_id=s.id and ws.active join location_services ls on ls.location_id=l.id and ls.service_id=s.id and ls.active where o.id=:org and o.booking_enabled and l.active and l.archived_at is null and m.active and m.provides_services and m.archived_at is null and s.active", Map.of("org", org, "loc", loc, "member", member, "svc", service));
         if (rows.isEmpty()) throw new ApiException(HttpStatus.BAD_REQUEST, "Service/member/location not configured");
         return rows.getFirst();
     }
@@ -143,7 +143,18 @@ public class BookingService {
         p.put("occStart", start.minusMinutes(v.before()));
         p.put("occEnd", end.plusMinutes(v.after()));
         p.put("exclude", excludeItem == null ? -1L : excludeItem);
-        var overlaps = db.queryForObject("select count(*) from reservation_items where member_id=:member and item_status='active' and id<>:exclude and occupied_period && tstzrange(cast(:occStart as timestamptz),cast(:occEnd as timestamptz),'[)')", p, Long.class);
+        var overlaps = db.queryForObject("""
+                SELECT
+                  (SELECT count(*) FROM reservation_items
+                   WHERE member_id=:member AND item_status='active' AND id<>:exclude
+                     AND occupied_period && tstzrange(CAST(:occStart AS timestamptz),CAST(:occEnd AS timestamptz),'[)'))
+                  +
+                  (SELECT count(*) FROM reservation_resources rr
+                   JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id
+                   WHERE res.member_id=:member AND rr.organization_id=:org AND rr.active
+                     AND rr.reservation_item_id<>:exclude
+                     AND rr.occupied_period && tstzrange(CAST(:occStart AS timestamptz),CAST(:occEnd AS timestamptz),'[)'))
+                """, p, Long.class);
         ensure(overlaps != null && overlaps == 0, "Slot occupied");
         var policy = db.queryForList("select min_notice_minutes,max_advance_days from booking_policies where location_id=:loc", Map.of("loc", loc));
         if (!policy.isEmpty()) {
@@ -170,13 +181,57 @@ public class BookingService {
 
     @Transactional
     public Map<String, Object> create(BookingDto.CreateBooking r) {
+        return create(r, true);
+    }
+
+    @Transactional
+    public Map<String, Object> create(BookingDto.CreateBooking r, boolean enforceCustomerChoices) {
         var start = utc(r.startsAt());
-        lock(r.organizationId(), r.memberId());
+        db.queryForList("SELECT id FROM organizations WHERE id=:id FOR UPDATE",
+                Map.of("id", r.organizationId()));
+        Long memberId=r.memberId();
+        if (enforceCustomerChoices) {
+            Boolean customerCanChoose=db.queryForObject("""
+                    SELECT customer_can_choose_staff FROM services
+                    WHERE organization_id=:org AND id=:service
+                    """,Map.of("org",r.organizationId(),"service",r.serviceId()),Boolean.class);
+            if (!Boolean.TRUE.equals(customerCanChoose)) {
+                var candidates=db.queryForList("""
+                        SELECT m.id FROM organization_members m
+                        JOIN member_locations ml ON ml.organization_id=m.organization_id AND ml.member_id=m.id
+                        JOIN worker_services ws ON ws.organization_id=m.organization_id AND ws.member_id=m.id
+                        WHERE m.organization_id=:org AND ml.location_id=:loc AND ws.service_id=:service
+                          AND ws.active AND m.active AND m.provides_services AND m.archived_at IS NULL
+                        ORDER BY m.id
+                        """,Map.of("org",r.organizationId(),"loc",r.locationId(),"service",r.serviceId()));
+                boolean available=false;
+                for (var candidate:candidates) {
+                    long candidateId=((Number)candidate.get("id")).longValue();
+                    lock(r.organizationId(),candidateId);
+                    try {
+                        checkAvailability(r.organizationId(),r.locationId(),candidateId,
+                                r.serviceId(),start,version(r.serviceId(),r.locationId(),start),null);
+                        memberId=candidateId;
+                        available=true;
+                        break;
+                    } catch (ApiException ex) {
+                        if (ex.status!=HttpStatus.CONFLICT && ex.status!=HttpStatus.BAD_REQUEST) throw ex;
+                    }
+                }
+                if (!available) throw new ApiException(HttpStatus.CONFLICT,"INSUFFICIENT_RESOURCES",
+                        "No staff member is available for this time");
+            } else if (memberId==null) {
+                throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Choose a staff member");
+            }
+        }
+        if (memberId==null)
+            throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Choose a staff member");
+        lock(r.organizationId(), memberId);
         Version v = version(r.serviceId(), r.locationId(), start);
-        checkAvailability(r.organizationId(), r.locationId(), r.memberId(), r.serviceId(), start, v, null);
+        checkAvailability(r.organizationId(), r.locationId(), memberId, r.serviceId(), start, v, null);
         var args = new MapSqlParameterSource().addValue("org", r.organizationId()).addValue("loc", r.locationId()).addValue("name", r.customerName()).addValue("email", r.customerEmail()).addValue("phone", r.customerPhone()).addValue("price", v.price()).addValue("currency", v.currency());
         long id = ((Number) db.queryForMap("insert into reservations(organization_id,location_id,customer_name,customer_email,customer_phone,status,total_amount,currency) values(:org,:loc,:name,:email,:phone,'confirmed',:price,:currency) returning id", args).get("id")).longValue();
-        insertItem(id, r.organizationId(), r.locationId(), r.serviceId(), r.memberId(), start, v);
+        insertItem(id, r.organizationId(), r.locationId(), r.serviceId(), memberId, start, v);
         String token = createToken(id);
         db.update("insert into reservation_events(reservation_id,event_type) values(:id,'created')", Map.of("id", id));
         return Map.of("id", id, "status", "confirmed", "startsAt", start, "endsAt", start.plusMinutes(v.duration()), "price", v.price(), "currency", v.currency(), "manageUrl", baseUrl + "/sprava/" + token);
@@ -185,6 +240,11 @@ public class BookingService {
     /** Public universal booking; serializes allocations by locking the tenant row. */
     @Transactional
     public Map<String, Object> createUniversal(BookingDto.CreateUniversalBooking r) {
+        return createUniversal(r, true);
+    }
+
+    @Transactional
+    public Map<String, Object> createUniversal(BookingDto.CreateUniversalBooking r, boolean enforceCustomerChoices) {
         OffsetDateTime start = utc(r.startsAt());
         // Same lock order as legacy create() and backoffice schedule edits.
         db.queryForList("SELECT id FROM organizations WHERE id=:org FOR UPDATE", Map.of("org", r.organizationId()));
@@ -232,7 +292,7 @@ public class BookingService {
                         if (e.status == HttpStatus.CONFLICT || e.status == HttpStatus.BAD_REQUEST) return false;
                         throw e;
                     }
-                });
+                }, enforceCustomerChoices);
         Long memberId = allocated.stream().filter(a -> a.memberId() != null)
                 .map(ResourceAllocationService.Allocation::memberId).findFirst().orElse(null);
         var args = new MapSqlParameterSource().addValue("org", r.organizationId())

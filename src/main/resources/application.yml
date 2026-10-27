@@ -56,6 +56,9 @@ app:
       expiration-minutes: ${JWT_EXPIRATION_MINUTES:10080}
     password-reset:
       minutes: ${PASSWORD_RESET_MINUTES:30}
+  ai-help:
+    api-key: ${OPENAI_API_KEY:}
+    model: ${OPENAI_MODEL:gpt-4o-mini}
 
 springdoc:
   swagger-ui:

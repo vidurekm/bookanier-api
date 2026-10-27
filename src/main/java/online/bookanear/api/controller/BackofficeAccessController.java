@@ -20,6 +20,7 @@ public class BackofficeAccessController {
         result.put("canWrite",security.canWrite(org,auth));
         result.put("isOwner",security.isOwner(org,auth));
         result.put("canManageBookings",security.canManageBookings(org,auth));
+        result.put("canManageOwnBookings",security.canManageOwnBookings(org,auth));
         result.put("canApproveOwnAbsence",own!=null && security.canApproveOwnAbsence(org,own,auth));
         return result;
     }

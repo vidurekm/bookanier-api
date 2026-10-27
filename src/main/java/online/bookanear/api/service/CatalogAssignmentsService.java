@@ -11,7 +11,11 @@ import java.util.*;
 @Service
 public class CatalogAssignmentsService {
     private final NamedParameterJdbcTemplate db;
-    public CatalogAssignmentsService(NamedParameterJdbcTemplate db) { this.db=db; }
+    private final StaffResourceService staffResourceService;
+    public CatalogAssignmentsService(NamedParameterJdbcTemplate db, StaffResourceService staffResourceService) {
+        this.db=db;
+        this.staffResourceService=staffResourceService;
+    }
     private void ensure(long org,String table,long id) {
         // Table identifiers are only fixed internal literals.
         if (!List.of("locations","organization_members","services").contains(table)) throw new IllegalArgumentException();
@@ -74,14 +78,12 @@ public class CatalogAssignmentsService {
                 """,Map.of("org",org,"member",member,"loc",id));
         for(long id:old) if(!wanted.contains(id)) {
             Long inUse=db.queryForObject("""
-                    SELECT (SELECT count(*) FROM resources r WHERE r.organization_id=:org
-                              AND r.location_id=:loc AND r.member_id=:member AND r.active)
-                         + (SELECT count(*) FROM schedule_rules sr WHERE sr.organization_id=:org
+                    SELECT (SELECT count(*) FROM schedule_rules sr WHERE sr.organization_id=:org
                               AND sr.location_id=:loc AND sr.member_id=:member
                               AND (upper_inf(sr.effective_dates) OR upper(sr.effective_dates)>CURRENT_DATE))
                     """,Map.of("org",org,"loc",id,"member",member),Long.class);
             if(inUse!=null && inUse>0) throw new ApiException(HttpStatus.CONFLICT,
-                    "Cannot remove location while staff resources or working schedules exist");
+                    "Cannot remove location while working schedules exist");
             // Historic reservations may prevent deletion via FK; surface as 409.
             try { db.update("""
                     DELETE FROM member_locations WHERE organization_id=:org AND member_id=:member AND location_id=:loc
@@ -90,6 +92,7 @@ public class CatalogAssignmentsService {
                 throw new ApiException(HttpStatus.CONFLICT,"Cannot remove a location used by reservations or schedules");
             }
         }
+        staffResourceService.synchronizeMember(org, member);
         return memberLocations(org,member);
     }
 }

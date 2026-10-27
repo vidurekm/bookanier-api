@@ -35,7 +35,11 @@ public class PublicCatalogService {
                 """, Map.of("org", id));
         var services = db.queryForList("""
                 SELECT s.id,s.name,s.description,sv.duration_minutes,sv.slot_interval_minutes,
-                       sv.price,sv.currency,sv.duration_mode,sv.max_duration_minutes
+                       sv.price,sv.currency,sv.duration_mode,sv.max_duration_minutes,
+                       s.customer_can_choose_staff,s.customer_can_choose_resource,
+                       COALESCE((SELECT req.quantity FROM service_resource_requirements req
+                           JOIN resource_types rt ON rt.id=req.resource_type_id
+                           WHERE req.service_id=s.id AND rt.category='staff'),1) AS required_staff_count
                 FROM services s JOIN service_versions sv ON sv.service_id=s.id
                 WHERE s.organization_id=:org AND s.active=true
                   AND sv.valid_during @> CAST(:day AS date)
@@ -57,7 +61,7 @@ public class PublicCatalogService {
                 FROM organization_members m
                 JOIN member_locations ml ON ml.member_id=m.id AND ml.organization_id=m.organization_id
                 JOIN worker_services ws ON ws.member_id=m.id AND ws.organization_id=m.organization_id AND ws.active=true
-                WHERE m.organization_id=:org AND m.active=true AND m.archived_at IS NULL ORDER BY m.display_name
+                WHERE m.organization_id=:org AND m.active=true AND m.provides_services=true AND m.archived_at IS NULL ORDER BY m.display_name
                 """, Map.of("org", id));
         var catalogServices = new ArrayList<Map<String,Object>>();
         for (var s : services) {
@@ -111,13 +115,13 @@ public class PublicCatalogService {
                 FROM service_resource_requirements rr JOIN resource_types rt ON rt.id=rr.resource_type_id AND rt.active
                 WHERE rr.service_id=:svc AND rt.organization_id=:org
                 """, Map.of("org",orgId,"svc",serviceId));
-        if (quantity != null && requirements.size() != 1)
-            throw new ApiException(HttpStatus.BAD_REQUEST, "Quantity requires exactly one resource type");
+        if (quantity != null && requirements.stream().filter(r->!"staff".equals(r.get("category"))).count() != 1)
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Quantity requires exactly one non-staff resource type");
         var members = db.queryForList("""
                 SELECT m.id FROM organization_members m
                 JOIN member_locations ml ON ml.member_id=m.id AND ml.location_id=:loc
                 JOIN worker_services ws ON ws.member_id=m.id AND ws.service_id=:svc AND ws.active
-                WHERE m.organization_id=:org AND m.active AND m.archived_at IS NULL
+                WHERE m.organization_id=:org AND m.active AND m.provides_services AND m.archived_at IS NULL
                 """, Map.of("org",orgId,"loc",locationId,"svc",serviceId));
         var policy = db.queryForList("SELECT min_notice_minutes,max_advance_days FROM booking_policies WHERE location_id=:loc",
                 Map.of("loc",locationId));
@@ -222,9 +226,15 @@ public class PublicCatalogService {
                 .addValue("from",OffsetDateTime.ofInstant(start.minus(Duration.ofMinutes(before)),ZoneOffset.UTC))
                 .addValue("to",OffsetDateTime.ofInstant(end.plus(Duration.ofMinutes(after)),ZoneOffset.UTC));
         Long busy = db.queryForObject("""
-                SELECT count(*) FROM reservation_items
-                WHERE member_id=:member AND item_status='active'
-                  AND occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)')
+                SELECT
+                  (SELECT count(*) FROM reservation_items
+                   WHERE member_id=:member AND item_status='active'
+                     AND occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)'))
+                  +
+                  (SELECT count(*) FROM reservation_resources rr
+                   JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id
+                   WHERE res.member_id=:member AND rr.active
+                     AND rr.occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)'))
                 """,args,Long.class);
         return busy==null || busy==0;
     }
@@ -251,7 +261,7 @@ public class PublicCatalogService {
             long count = available.stream().filter(r -> !"staff".equals(category)
                     || (r.get("member_id")!=null && freeMembers.contains(((Number)r.get("member_id")).longValue()))).count();
             int required=((Number)req.get("quantity")).intValue();
-            if (quantity!=null) { if(quantity<required) return false; required=quantity; }
+            if (quantity!=null && !"staff".equals(category)) { if(quantity<required) return false; required=quantity; }
             if (count < required) return false;
         }
         return true;

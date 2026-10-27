@@ -51,6 +51,79 @@ public class OrganizationSecurity {
                 """,Map.of("org",organizationId,"user",userId),Boolean.class));
     }
 
+    public boolean canManageOwnBookings(long organizationId, Authentication authentication) {
+        Long userId = authenticatedUserId(authentication);
+        if (userId == null || !canRead(organizationId, authentication)) return false;
+        return Boolean.TRUE.equals(db.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM organization_members
+                  WHERE organization_id=:org AND user_id=:user AND active=true
+                    AND can_manage_own_bookings AND NOT can_manage_bookings)
+                """, Map.of("org", organizationId, "user", userId), Boolean.class));
+    }
+
+    public boolean canManageReservation(long organizationId, long reservationId,
+                                        Authentication authentication) {
+        if (canWrite(organizationId, authentication)) return true;
+        boolean manageColleagues = canManageBookings(organizationId, authentication);
+        boolean manageOwn = canManageOwnBookings(organizationId, authentication);
+        if (!manageColleagues && !manageOwn) return false;
+        Long memberId = ownMemberId(organizationId, authentication);
+        if (memberId == null) return false;
+        return Boolean.TRUE.equals(db.queryForObject("""
+                SELECT (
+                  :manageOwn AND EXISTS (
+                    SELECT 1 FROM reservation_items ri
+                    WHERE ri.organization_id=:org AND ri.reservation_id=:reservation
+                      AND ri.item_status='active'
+                      AND (ri.member_id=:member OR EXISTS (
+                        SELECT 1 FROM reservation_resources rr
+                        JOIN resources res ON res.organization_id=rr.organization_id
+                                          AND res.id=rr.resource_id AND res.member_id=:member
+                        WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                          AND rr.active
+                      ))
+                  ) AND NOT EXISTS (
+                    SELECT 1 FROM reservation_items ri
+                    WHERE ri.organization_id=:org AND ri.reservation_id=:reservation
+                      AND ri.item_status='active'
+                      AND (ri.member_id IS DISTINCT FROM :member) AND NOT EXISTS (
+                        SELECT 1 FROM reservation_resources rr
+                        JOIN resources res ON res.organization_id=rr.organization_id
+                                          AND res.id=rr.resource_id AND res.member_id=:member
+                        WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                          AND rr.active
+                      )
+                  )
+                ) OR (
+                  :manageColleagues AND EXISTS (
+                    SELECT 1 FROM reservation_items ri
+                    WHERE ri.organization_id=:org AND ri.reservation_id=:reservation
+                      AND ri.item_status='active'
+                      AND ((ri.member_id IS NOT NULL AND ri.member_id<>:member) OR EXISTS (
+                        SELECT 1 FROM reservation_resources rr
+                        JOIN resources res ON res.organization_id=rr.organization_id
+                                          AND res.id=rr.resource_id AND res.member_id<>:member
+                        WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                          AND rr.active
+                      ))
+                  ) AND NOT EXISTS (
+                    SELECT 1 FROM reservation_items ri
+                    WHERE ri.organization_id=:org AND ri.reservation_id=:reservation
+                      AND ri.item_status='active'
+                      AND (ri.member_id=:member OR EXISTS (
+                        SELECT 1 FROM reservation_resources rr
+                        JOIN resources res ON res.organization_id=rr.organization_id
+                                          AND res.id=rr.resource_id AND res.member_id=:member
+                        WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                          AND rr.active
+                      ))
+                  )
+                )
+                """, Map.of("org", organizationId, "reservation", reservationId, "member", memberId,
+                "manageOwn", manageOwn, "manageColleagues", manageColleagues),
+                Boolean.class));
+    }
+
     public boolean canApproveOwnAbsence(long organizationId, long memberId, Authentication authentication) {
         if (canWrite(organizationId, authentication)) return true;
         Long userId=authenticatedUserId(authentication);

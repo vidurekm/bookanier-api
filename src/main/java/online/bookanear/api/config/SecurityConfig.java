@@ -58,6 +58,7 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/invitations").permitAll()
                         .requestMatchers("/api/v1/public/**").permitAll()
                         .requestMatchers("/api/v1/auth/me", "/api/v1/auth/me/**").authenticated()
+                        .requestMatchers("/api/v1/help/**").authenticated()
 
                         .requestMatchers(
                                 HttpMethod.POST,

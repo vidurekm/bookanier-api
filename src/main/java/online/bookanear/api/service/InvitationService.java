@@ -28,15 +28,18 @@ public class InvitationService {
     private static final int INVITATION_HOURS = 24;
     private final NamedParameterJdbcTemplate db;
     private final JavaMailSender mailSender;
+    private final StaffResourceService staffResourceService;
     private final SecureRandom random = new SecureRandom();
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     @Value("${registration.home-url:http://localhost:5173/}") private String frontendUrl;
     @Value("${registration.from-email}") private String fromEmail;
 
-    public InvitationService(NamedParameterJdbcTemplate db, JavaMailSender mailSender) {
+    public InvitationService(NamedParameterJdbcTemplate db, JavaMailSender mailSender,
+                             StaffResourceService staffResourceService) {
         this.db = db;
         this.mailSender = mailSender;
+        this.staffResourceService = staffResourceService;
     }
 
     private static String hash(String token) {
@@ -60,11 +63,15 @@ public class InvitationService {
         String role = request.role() == null ? "worker" : request.role();
         String displayName = request.displayName().trim();
         boolean canManageBookings = Boolean.TRUE.equals(request.canManageBookings());
+        boolean canManageOwnBookings = Boolean.TRUE.equals(request.canManageOwnBookings());
+        if (canManageBookings && canManageOwnBookings)
+            throw new ApiException(HttpStatus.BAD_REQUEST, "VALIDATION_ERROR",
+                    "A worker cannot manage both colleagues' bookings and only their own bookings");
         boolean canApproveOwnAbsence = Boolean.TRUE.equals(request.canApproveOwnAbsence());
         Long memberId = request.memberId();
         if (memberId != null) {
             var members = db.queryForList("""
-                    SELECT display_name,role,active,user_id,can_manage_bookings,can_approve_own_absence,archived_at
+                    SELECT display_name,role,active,user_id,can_manage_bookings,can_manage_own_bookings,can_approve_own_absence,archived_at
                     FROM organization_members WHERE organization_id=:org AND id=:member
                     """, Map.of("org", organizationId, "member", memberId));
             if (members.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Member not found");
@@ -76,6 +83,7 @@ public class InvitationService {
             displayName = (String) member.get("display_name");
             role = (String) member.get("role");
             canManageBookings = Boolean.TRUE.equals(member.get("can_manage_bookings"));
+            canManageOwnBookings = Boolean.TRUE.equals(member.get("can_manage_own_bookings"));
             canApproveOwnAbsence = Boolean.TRUE.equals(member.get("can_approve_own_absence"));
         }
         var organization = db.queryForList("SELECT name FROM organizations WHERE id=:org",
@@ -100,12 +108,13 @@ public class InvitationService {
         String token = newToken();
         db.update("""
                 INSERT INTO organization_invitations
-                  (organization_id,member_id,email,display_name,role,can_manage_bookings,
+                  (organization_id,member_id,email,display_name,role,can_manage_bookings,can_manage_own_bookings,
                    can_approve_own_absence,token_hash,expires_at)
-                VALUES (:org,:member,:email,:name,:role,:manage,:approve,:hash,:expires)
+                VALUES (:org,:member,:email,:name,:role,:manage,:manageOwn,:approve,:hash,:expires)
                 """, new MapSqlParameterSource().addValue("org", organizationId).addValue("member", memberId).addValue("email", email)
                 .addValue("name", displayName).addValue("role", role)
                 .addValue("manage", canManageBookings)
+                .addValue("manageOwn", canManageOwnBookings)
                 .addValue("approve", canApproveOwnAbsence)
                 .addValue("hash", hash(token))
                 .addValue("expires", OffsetDateTime.now(ZoneOffset.UTC).plusHours(INVITATION_HOURS)));
@@ -148,7 +157,7 @@ public class InvitationService {
         String digest = hash(request.token());
         var rows = db.queryForList("""
                 SELECT i.id,i.organization_id,i.member_id,i.email,i.display_name,i.role,
-                       i.can_manage_bookings,i.can_approve_own_absence
+                       i.can_manage_bookings,i.can_manage_own_bookings,i.can_approve_own_absence
                 FROM organization_invitations i
                 JOIN organizations o ON o.id=i.organization_id
                 WHERE i.token_hash=:hash AND i.consumed_at IS NULL AND i.expires_at>now()
@@ -199,11 +208,12 @@ public class InvitationService {
         if (memberId == null) {
             db.update("""
                     INSERT INTO organization_members
-                      (organization_id,user_id,display_name,role,can_manage_bookings,can_approve_own_absence)
-                    VALUES (:org,:user,:name,:role,:manage,:approve)
+                      (organization_id,user_id,display_name,role,can_manage_bookings,can_manage_own_bookings,can_approve_own_absence)
+                    VALUES (:org,:user,:name,:role,:manage,:manageOwn,:approve)
                     """, new MapSqlParameterSource().addValue("org", organizationId).addValue("user", userId)
                     .addValue("name", invitation.get("display_name")).addValue("role", invitation.get("role"))
                     .addValue("manage", invitation.get("can_manage_bookings"))
+                    .addValue("manageOwn", invitation.get("can_manage_own_bookings"))
                     .addValue("approve", invitation.get("can_approve_own_absence")));
         } else if (db.update("""
                 UPDATE organization_members SET user_id=:user,active=true
@@ -211,6 +221,7 @@ public class InvitationService {
                 """, Map.of("user", userId, "org", organizationId, "member", memberId)) != 1) {
             throw new ApiException(HttpStatus.CONFLICT, "This member was already linked to an account");
         }
+        if (memberId != null) staffResourceService.synchronizeMember(organizationId, memberId);
         db.update("UPDATE organization_invitations SET consumed_at=now() WHERE id=:id",
                 Map.of("id", invitation.get("id")));
         return Map.of("status", "accepted");

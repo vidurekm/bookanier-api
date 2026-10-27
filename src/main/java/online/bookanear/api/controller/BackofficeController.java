@@ -44,6 +44,13 @@ public class BackofficeController {
         return service.updateResourceType(org, id, request);
     }
 
+    @DeleteMapping("/{org}/resource-types/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    public void deleteResourceType(@PathVariable long org, @PathVariable long id) {
+        service.deleteResourceType(org, id);
+    }
+
     @GetMapping("/{org}/locations/{loc}/resources")
     @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
     public Object resources(@PathVariable long org, @PathVariable long loc) {
@@ -65,10 +72,30 @@ public class BackofficeController {
         return service.updateResource(org, loc, id, request);
     }
 
+    @DeleteMapping("/{org}/locations/{loc}/resources/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    public void deleteResource(@PathVariable long org, @PathVariable long loc, @PathVariable long id) {
+        service.deleteResource(org, loc, id);
+    }
+
     @GetMapping("/{org}/services/{id}/resource-requirements")
     @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
     public Object resourceRequirements(@PathVariable long org, @PathVariable long id) {
         return service.resourceRequirements(org, id);
+    }
+
+    @GetMapping("/{org}/services/{id}/booking-options")
+    @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
+    public Object serviceBookingOptions(@PathVariable long org, @PathVariable long id) {
+        return service.serviceBookingOptions(org, id);
+    }
+
+    @PutMapping("/{org}/services/{id}/booking-options")
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    public Object updateServiceBookingOptions(@PathVariable long org, @PathVariable long id,
+            @Valid @RequestBody BackofficeDto.ServiceBookingOptions request) {
+        return service.updateServiceBookingOptions(org, id, request);
     }
 
     @PutMapping("/{org}/services/{id}/resource-requirements")
@@ -346,13 +373,12 @@ public class BackofficeController {
         return service.updateOrganization(org, r);
     }
 
-    // Soft delete: the schema permits 'suspended', not 'deleted'.
     @DeleteMapping("/{org}")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     @PreAuthorize("@organizationSecurity.isOwner(#p0, authentication)")
-    @Operation(summary = "Suspend organization", description = "Suspend an organization without permanently deleting its data. Owner permission is required.")
-    public void deactivateOrganization(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org) {
-        service.deactivateOrganization(org);
+    @Operation(summary = "Delete organization", description = "Permanently delete an organization and its data. Owner permission is required.")
+    public void deleteOrganization(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org) {
+        service.deleteOrganization(org);
     }
 
     @PostMapping("/{org}/locations")
@@ -382,6 +408,24 @@ public class BackofficeController {
         return service.customers(org, name, email, page, size, sort, q);
     }
 
+    @GetMapping("/{org}/booking-customers")
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    @Operation(summary = "Search booking customers", description = "Group reservation contacts by normalized email and keep reservations without email separate.")
+    public Object bookingCustomers(@PathVariable long org,
+            @Parameter(description = "Zero-based page index.") @RequestParam(defaultValue="0") int page,
+            @Parameter(description = "Page size; the server caps the maximum number of records.") @RequestParam(defaultValue="20") int size,
+            @Parameter(description = "Keyword search across customer name, email and phone.") @RequestParam(required=false) String q,
+            @Parameter(description = "Sort by one supported field and direction.") @RequestParam(defaultValue="lastReservationAt,desc") String sort) {
+        return service.bookingCustomers(org, page, size, q, sort);
+    }
+
+    @GetMapping("/{org}/booking-customers/{id}/reservations")
+    @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
+    @Operation(summary = "List booking customer reservations", description = "List reservations for the normalized email represented by this customer's first reservation.")
+    public Object bookingCustomerReservations(@PathVariable long org, @PathVariable long id) {
+        return service.bookingCustomerReservations(org, id);
+    }
+
     @PostMapping("/{org}/customers")
     @ResponseStatus(HttpStatus.CREATED)
     @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
@@ -392,14 +436,17 @@ public class BackofficeController {
 
     @GetMapping("/{org}/reservations")
     @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
-    @Operation(summary = "Search reservations", description = "Filter, sort and paginate reservations. Worker visibility is limited by authorization.")
+    @Operation(summary = "Search reservations", description = "Filter reservations by location, status, customer, worker, or resource and paginate results. Worker visibility is limited by authorization.")
     public Object reservations(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Filter by location identifier.") @RequestParam(required=false) Long locationId, Authentication authentication,
             @Parameter(description = "Filter by status.") @RequestParam(required=false) String status,
+            @Parameter(description = "Include only reservations with an active booking item starting in the future.") @RequestParam(defaultValue="false") boolean upcomingOnly,
+            @Parameter(description = "Filter by assigned worker identifier.") @RequestParam(required=false) Long memberId,
+            @Parameter(description = "Filter by assigned non-staff resource identifier.") @RequestParam(required=false) Long resourceId,
             @Parameter(description = "Start of the filter range (inclusive); use ISO 8601 format.") @RequestParam(required=false) java.time.OffsetDateTime from,
             @Parameter(description = "End of the filter range (inclusive); use ISO 8601 format.") @RequestParam(required=false) java.time.OffsetDateTime to,
             @Parameter(description = "Zero-based page index.") @RequestParam(defaultValue="0") int page, @Parameter(description = "Page size; the server caps the maximum number of records.") @RequestParam(defaultValue="20") int size,
-            @Parameter(description = "Keyword search across the supported text columns.") @RequestParam(required=false) String q, @Parameter(description = "Sort by one supported field and direction, for example name,asc or id,desc.") @RequestParam(defaultValue="createdAt,desc") String sort) {
-        return service.reservations(org, locationId, authentication, status, from, to, page, size, q, sort);
+            @Parameter(description = "Search by customer name or email.") @RequestParam(required=false) String q, @Parameter(description = "Sort by one supported field and direction, for example name,asc or id,desc.") @RequestParam(defaultValue="createdAt,desc") String sort) {
+        return service.reservations(org, locationId, authentication, status, upcomingOnly, memberId, resourceId, from, to, page, size, q, sort);
     }
 
     @GetMapping("/{org}/members")
@@ -468,5 +515,14 @@ public class BackofficeController {
             Authentication authentication) {
         return service.listOrganizations(q, name, email, phone, timezone, status, bookingEnabled,
                 createdFrom, createdTo, page, size, sort, authentication);
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    @Operation(summary = "Create an organization", description = "Create an organization and make the authenticated user its owner.")
+    public Map<String, Object> createOrganization(
+            @Valid @RequestBody BackofficeDto.OrganizationCreate request,
+            Authentication authentication) {
+        return service.createOrganization(request, authentication);
     }
 }
