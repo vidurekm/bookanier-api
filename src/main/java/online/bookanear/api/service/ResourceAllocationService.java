@@ -26,12 +26,23 @@ public class ResourceAllocationService {
 
     public record Allocation(long resourceId, Long memberId, String category, long typeId,
                              int quantity, Integer minCapacity, Long preferredResourceId) {}
+    public record Demand(long typeId, int quantity, Integer minCapacity, Long preferredResourceId) {}
 
     public List<Allocation> allocate(long org, long loc, long service,
                                      OffsetDateTime occupiedFrom, OffsetDateTime occupiedTo,
                                      BookingDto.CreateUniversalBooking request,
                                      Predicate<Long> staffAvailability,
                                      boolean enforceCustomerChoices) {
+        return allocate(org, loc, service, occupiedFrom, occupiedTo, request,
+                staffAvailability, enforceCustomerChoices, null, List.of());
+    }
+
+    public List<Allocation> allocate(long org, long loc, long service,
+                                     OffsetDateTime occupiedFrom, OffsetDateTime occupiedTo,
+                                     BookingDto.CreateUniversalBooking request,
+                                     Predicate<Long> staffAvailability,
+                                     boolean enforceCustomerChoices, Long excludedItemId,
+                                     List<Demand> existingDemands) {
         var choices = db.queryForMap("""
                 SELECT customer_can_choose_staff,customer_can_choose_resource
                 FROM services WHERE organization_id=:org AND id=:service
@@ -74,7 +85,7 @@ public class ResourceAllocationService {
         if (request.partySize() != null && configured.stream().noneMatch(r -> "space".equals(r.get("category"))))
             throw new ApiException(HttpStatus.BAD_REQUEST, "partySize requires a space resource type");
 
-        if(!preferredMembers.isEmpty() && configured.stream().noneMatch(x->"staff".equals(x.get("category"))))
+        if(enforceCustomerChoices && !preferredMembers.isEmpty() && configured.stream().noneMatch(x->"staff".equals(x.get("category"))))
             throw new ApiException(HttpStatus.BAD_REQUEST,"VALIDATION_ERROR","Member selection requires staff resources");
         List<Allocation> selected = new ArrayList<>();
         Set<Long> used = new HashSet<>();
@@ -84,8 +95,11 @@ public class ResourceAllocationService {
             long typeId = ((Number) requirement.get("resource_type_id")).longValue();
             String category = (String) requirement.get("category");
             int minimumQuantity = ((Number) requirement.get("quantity")).intValue();
+            Demand existingDemand = existingDemands.stream()
+                    .filter(demand -> demand.typeId() == typeId).findFirst().orElse(null);
             int quantity = request.quantity() == null || "staff".equals(category)
-                    ? minimumQuantity : request.quantity();
+                    ? (existingDemand == null ? minimumQuantity : existingDemand.quantity())
+                    : request.quantity();
             if (quantity < minimumQuantity)
                 throw new ApiException(HttpStatus.BAD_REQUEST, "Quantity is below service minimum");
             if (quantity < 1 || quantity > 100)
@@ -101,13 +115,17 @@ public class ResourceAllocationService {
                         "Selected staff count does not match the service requirement");
             Integer minCapacity = requirement.get("min_capacity") == null ? null
                     : ((Number) requirement.get("min_capacity")).intValue();
-            if ("space".equals(category) && request.partySize() != null)
+            if (existingDemand != null) minCapacity = existingDemand.minCapacity();
+            else if ("space".equals(category) && request.partySize() != null)
                 minCapacity = Math.max(minCapacity == null ? 1 : minCapacity, request.partySize());
-            Long preferred = !"staff".equals(category) ? request.preferredResourceId() : null;
+            Long preferred = !"staff".equals(category)
+                    ? (existingDemand == null ? request.preferredResourceId() : existingDemand.preferredResourceId())
+                    : null;
             var params = new MapSqlParameterSource()
                     .addValue("org", org).addValue("loc", loc).addValue("type", typeId).addValue("service",service)
                     .addValue("capacity", minCapacity == null ? 1 : minCapacity)
                     .addValue("from", occupiedFrom).addValue("to", occupiedTo)
+                    .addValue("exclude", excludedItemId)
                     .addValue("preferred", preferred);
             var candidates = db.queryForList("""
                     SELECT r.id, r.member_id
@@ -123,9 +141,41 @@ public class ResourceAllocationService {
                       AND NOT EXISTS (
                         SELECT 1 FROM reservation_resources rr
                         WHERE rr.organization_id=:org AND rr.resource_id=r.id AND rr.active
+                          AND (CAST(:exclude AS bigint) IS NULL OR rr.reservation_item_id<>:exclude)
                           AND rr.occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)')
                       )
-                    ORDER BY r.capacity, r.id
+                    ORDER BY r.capacity,
+                      (SELECT COALESCE(SUM(workload.duration_minutes),0)
+                       FROM (
+                         SELECT ri.id,ri.duration_minutes
+                         FROM reservation_items ri
+                         JOIN reservations rs ON rs.organization_id=ri.organization_id
+                           AND rs.id=ri.reservation_id
+                         JOIN locations lo ON lo.id=:loc
+                         WHERE ri.organization_id=:org AND ri.member_id=r.member_id
+                           AND rs.status<>'cancelled'
+                           AND (CAST(:exclude AS bigint) IS NULL OR ri.id<>:exclude)
+                           AND (ri.starts_at AT TIME ZONE lo.timezone)::date
+                             = (CAST(:from AS timestamptz) AT TIME ZONE lo.timezone)::date
+                         UNION
+                         SELECT ri.id,ri.duration_minutes
+                         FROM reservation_items ri
+                         JOIN reservations rs ON rs.organization_id=ri.organization_id
+                           AND rs.id=ri.reservation_id
+                         JOIN reservation_resources assigned_rr
+                           ON assigned_rr.organization_id=ri.organization_id
+                          AND assigned_rr.reservation_item_id=ri.id AND assigned_rr.active
+                         JOIN resources assigned_resource
+                           ON assigned_resource.organization_id=assigned_rr.organization_id
+                          AND assigned_resource.id=assigned_rr.resource_id
+                          AND assigned_resource.member_id=r.member_id
+                         JOIN locations lo ON lo.id=:loc
+                         WHERE ri.organization_id=:org AND rs.status<>'cancelled'
+                           AND (CAST(:exclude AS bigint) IS NULL OR ri.id<>:exclude)
+                           AND (ri.starts_at AT TIME ZONE lo.timezone)::date
+                             = (CAST(:from AS timestamptz) AT TIME ZONE lo.timezone)::date
+                       ) workload),
+                      r.id
                     FOR UPDATE OF r
                     """, params);
             int found = 0;
@@ -150,9 +200,30 @@ public class ResourceAllocationService {
             if (found < quantity)
                 throw new ApiException(HttpStatus.CONFLICT, "INSUFFICIENT_RESOURCES", "Not enough available resources of type " + typeId);
         }
-        if (!preferredMembers.isEmpty() && selectedStaffCount != preferredMembers.size())
+        if (!preferredMembers.isEmpty()
+                && configured.stream().anyMatch(requirement -> "staff".equals(requirement.get("category")))
+                && selectedStaffCount > 0 && selectedStaffCount != preferredMembers.size())
             throw new ApiException(HttpStatus.CONFLICT,"INSUFFICIENT_RESOURCES","One or more selected staff members are unavailable");
         return selected;
+    }
+
+    public void replaceAssignments(long org, long loc, long itemId, OffsetDateTime occupiedFrom,
+                                   OffsetDateTime occupiedTo, List<Allocation> allocations) {
+        db.update("""
+                UPDATE reservation_resources SET active=false
+                WHERE organization_id=:org AND reservation_item_id=:item AND active
+                """, Map.of("org", org, "item", itemId));
+        for (Allocation allocation : allocations) {
+            db.update("""
+                    INSERT INTO reservation_resources
+                        (organization_id,location_id,reservation_item_id,resource_id,occupied_period)
+                    VALUES (:org,:loc,:item,:resource,
+                        tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)'))
+                    """, new MapSqlParameterSource()
+                    .addValue("org", org).addValue("loc", loc).addValue("item", itemId)
+                    .addValue("resource", allocation.resourceId())
+                    .addValue("from", occupiedFrom).addValue("to", occupiedTo));
+        }
     }
 
     public void persist(long org, long loc, long itemId, OffsetDateTime occupiedFrom,

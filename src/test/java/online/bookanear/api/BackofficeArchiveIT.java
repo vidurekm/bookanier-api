@@ -9,6 +9,7 @@ import org.springframework.http.HttpStatus;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.util.Map;
+import java.util.List;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 
@@ -123,6 +124,47 @@ class BackofficeArchiveIT extends PostgresIntegrationTest {
                 Map.of("id", booking.reservation()));
         service.archiveLocation(booking.org(), booking.location());
         service.archiveMember(booking.org(), booking.member());
+    }
+
+    @Test
+    void cannotDeactivateBookedLocation() {
+        var booking = futureBooking();
+        assertThatThrownBy(() -> service.updateLocation(booking.org(), booking.location(),
+                new BackofficeDto.LocationUpsert("Booked branch", "", "Europe/Prague", false)))
+                .isInstanceOfSatisfying(ApiException.class,
+                        ex -> assertThat(ex.code).isEqualTo("LOCATION_HAS_ACTIVE_RESERVATIONS"));
+        assertThat(db.queryForObject("SELECT active FROM locations WHERE id=:id",
+                Map.of("id", booking.location()), Boolean.class)).isTrue();
+    }
+
+    @Test
+    void conflictingWeeklyAndDatedChangesRollBackEvenWhenAutoCancellationIsRequested() {
+        var booking = futureBooking();
+        var params = Map.of("org", booking.org(), "location", booking.location());
+        db.update("""
+                INSERT INTO schedule_rules(organization_id,location_id,kind,weekday,
+                    start_time,end_time,effective_dates)
+                SELECT :org,:location,'open',weekday,'00:00'::time,'23:59'::time,
+                    daterange(current_date,NULL,'[)') FROM generate_series(1,7) weekday
+                """, params);
+        assertThatThrownBy(() -> service.replaceWeeklySchedule(booking.org(), booking.location(), null,
+                "open", new BackofficeDto.WeeklySchedule(List.of()), false, true))
+                .isInstanceOf(online.bookanear.api.exception.ScheduleConflictException.class);
+        assertThat(db.queryForObject("SELECT count(*) FROM schedule_rules WHERE location_id=:location",
+                params, Integer.class)).isEqualTo(7);
+        var date = db.queryForObject("""
+                SELECT (ri.starts_at AT TIME ZONE l.timezone)::date FROM reservation_items ri
+                JOIN locations l ON l.id=ri.location_id
+                WHERE reservation_id=:id
+                """, Map.of("id", booking.reservation()), java.time.LocalDate.class);
+        assertThatThrownBy(() -> service.replaceDatedSchedule(booking.org(), booking.location(), null,
+                "open", new BackofficeDto.DatedSchedule(List.of(
+                        new BackofficeDto.DatedScheduleDay(date, List.of()))), false, true))
+                .isInstanceOf(online.bookanear.api.exception.ScheduleConflictException.class);
+        assertThat(db.queryForObject("SELECT count(*) FROM schedule_date_overrides WHERE location_id=:location",
+                params, Integer.class)).isZero();
+        assertThat(db.queryForObject("SELECT status FROM reservations WHERE id=:id",
+                Map.of("id", booking.reservation()), String.class)).isEqualTo("confirmed");
     }
 
     @Test

@@ -42,19 +42,24 @@ public final class SetupDto {
                                        String start, String end) {}
     public record Options(boolean customerSelectResource, boolean showStaffChoice,
                           @Min(1) @Max(10000) int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat,
-                          @Min(1) @Max(3650) Integer maxAdvanceDays, Boolean trackResources) {
+                          @Min(1) @Max(3650) Integer maxAdvanceDays, Boolean trackResources,
+                          @Min(1) @Max(7) Integer weekStartsOn) {
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, null, null, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, null, null, null, null);
         }
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, null, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, null, null, null);
         }
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat,
                        @Min(1) @Max(3650) Integer maxAdvanceDays) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, maxAdvanceDays, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, maxAdvanceDays, null, null);
+        }
+        public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity, String defaultPublicLanguage, String defaultCurrency, String dateFormat,
+                       @Min(1) @Max(3650) Integer maxAdvanceDays, Boolean trackResources) {
+            this(customerSelectResource, showStaffChoice, eventCapacity, defaultPublicLanguage, defaultCurrency, dateFormat, maxAdvanceDays, trackResources, null);
         }
         public Options(boolean customerSelectResource, boolean showStaffChoice, int eventCapacity) {
-            this(customerSelectResource, showStaffChoice, eventCapacity, null, null, null, null, null);
+            this(customerSelectResource, showStaffChoice, eventCapacity, null, null, null, null, null, null);
         }
     }
     public record Draft(

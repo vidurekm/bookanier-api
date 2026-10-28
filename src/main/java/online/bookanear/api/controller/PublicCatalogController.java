@@ -3,6 +3,7 @@ package online.bookanear.api.controller;
 import online.bookanear.api.service.PublicCatalogService;
 import org.springframework.web.bind.annotation.*;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -25,7 +26,10 @@ public class PublicCatalogController {
                                      @RequestParam long serviceId,
                                      @RequestParam LocalDate date,
                                      @RequestParam(required = false) Integer partySize,
-                                     @RequestParam(required = false) Integer quantity) {
-        return catalog.slots(publicId, locationId, serviceId, date, partySize, quantity);
+                                     @RequestParam(required = false) Integer quantity,
+                                     @RequestParam(required = false) List<Long> preferredMemberIds,
+                                     @RequestParam(required = false) Long preferredResourceId) {
+        return catalog.slots(publicId, locationId, serviceId, date, partySize, quantity,
+                preferredMemberIds, preferredResourceId);
     }
 }

@@ -57,6 +57,8 @@ public final class BookingDto {
     }
 
     @Schema(description = "New start time requested for an existing reservation.")
-    public record Reschedule(@Schema(description = "New start time with UTC offset (ISO 8601).", example = "2026-11-03T11:00:00+01:00") @NotNull OffsetDateTime startsAt) {
+    public record Reschedule(@Schema(description = "New start time with UTC offset (ISO 8601).", example = "2026-11-03T11:00:00+01:00") @NotNull OffsetDateTime startsAt,
+                            @Schema(description = "Optional new staff members (back office only).") java.util.List<Long> preferredMemberIds,
+                            @Schema(description = "Optional new resource (back office only).") Long preferredResourceId) {
     }
 }

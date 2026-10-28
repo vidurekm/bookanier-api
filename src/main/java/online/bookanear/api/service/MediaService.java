@@ -86,12 +86,17 @@ public class MediaService {
     public MediaDto.ImageInfo attach(long org, Kind kind, long targetId, MediaDto.AttachImage request) {
         lockTarget(org, kind, targetId);
         long mediaId = request.mediaId();
-        var asset = asset(org, mediaId);
+        var asset = lockAsset(org, mediaId);
         Map<String, Object> args = Map.of("org", org, "target", targetId, "media", mediaId,
                 "sort", request.sortOrder(), "primary", request.primary());
         if (kind == Kind.ORGANIZATION_LOGO) {
+            List<Long> replaced = db.queryForList(
+                    "SELECT media_id FROM organization_logos WHERE organization_id=:org FOR UPDATE",
+                    Map.of("org", org), Long.class);
+            replaced.stream().filter(id -> id != mediaId).forEach(id -> lockAssetIfPresent(org, id));
             db.update("DELETE FROM organization_logos WHERE organization_id=:org", args);
             db.update("INSERT INTO organization_logos (organization_id,media_id) VALUES (:org,:media)", args);
+            replaced.stream().filter(id -> id != mediaId).forEach(id -> deleteIfUnreferenced(org, id));
             return new MediaDto.ImageInfo(mediaId, publicUrl(mediaId), (String) asset.get("content_type"),
                     ((Number) asset.get("width")).intValue(), ((Number) asset.get("height")).intValue(), 0, true);
         }
@@ -115,15 +120,18 @@ public class MediaService {
     @Transactional
     public void detach(long org, Kind kind, long targetId, long mediaId) {
         lockTarget(org, kind, targetId);
+        lockAssetIfPresent(org, mediaId);
         Map<String, Object> args = Map.of("org", org, "target", targetId, "media", mediaId);
         if (kind == Kind.ORGANIZATION_LOGO) {
             int removed = db.update("DELETE FROM organization_logos WHERE organization_id=:org AND media_id=:media", args);
             if (removed == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Image assignment not found");
+            deleteIfUnreferenced(org, mediaId);
             return;
         }
         int n = db.update("DELETE FROM " + kind.table + " WHERE organization_id=:org AND " +
                 kind.column + "=:target AND media_id=:media", args);
         if (n == 0) throw new ApiException(HttpStatus.NOT_FOUND, "Image assignment not found");
+        deleteIfUnreferenced(org, mediaId);
         if (kind == Kind.ORGANIZATION) {
             db.update("""
                     UPDATE organization_images SET is_primary=true
@@ -188,8 +196,9 @@ public class MediaService {
     }
 
     /** Delete only unattached assets; on storage failure keep the database record for retry. */
+    @Transactional
     public void delete(long org, long mediaId) {
-        var a = asset(org, mediaId);
+        var a = lockAsset(org, mediaId);
         for (Kind k : Kind.values()) {
             Integer refs = db.queryForObject("SELECT count(*) FROM " + k.table +
                     " WHERE organization_id=:org AND media_id=:media", Map.of("org", org, "media", mediaId), Integer.class);
@@ -197,6 +206,19 @@ public class MediaService {
         }
 
         storage.delete((String) a.get("storage_key"));
+        db.update("DELETE FROM media_assets WHERE organization_id=:org AND id=:media",
+                Map.of("org", org, "media", mediaId));
+    }
+
+    private void deleteIfUnreferenced(long org, long mediaId) {
+        var asset = lockAssetIfPresent(org, mediaId);
+        if (asset == null) return;
+        for (Kind k : Kind.values()) {
+            Integer refs = db.queryForObject("SELECT count(*) FROM " + k.table +
+                    " WHERE organization_id=:org AND media_id=:media", Map.of("org", org, "media", mediaId), Integer.class);
+            if (refs != null && refs > 0) return;
+        }
+        storage.delete((String) asset.get("storage_key"));
         db.update("DELETE FROM media_assets WHERE organization_id=:org AND id=:media",
                 Map.of("org", org, "media", mediaId));
     }
@@ -209,11 +231,21 @@ public class MediaService {
         }
     }
 
-    private Map<String, Object> asset(long org, long id) {
-        var rows = db.queryForList("SELECT storage_key,content_type,width,height FROM media_assets WHERE organization_id=:org AND id=:id",
-                Map.of("org", org, "id", id));
+    private Map<String, Object> lockAsset(long org, long id) {
+        var rows = db.queryForList("""
+                SELECT storage_key,content_type,width,height FROM media_assets
+                WHERE organization_id=:org AND id=:id FOR UPDATE
+                """, Map.of("org", org, "id", id));
         if (rows.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Image not found");
         return rows.getFirst();
+    }
+
+    private Map<String, Object> lockAssetIfPresent(long org, long id) {
+        var rows = db.queryForList("""
+                SELECT storage_key,content_type,width,height FROM media_assets
+                WHERE organization_id=:org AND id=:id FOR UPDATE
+                """, Map.of("org", org, "id", id));
+        return rows.isEmpty() ? null : rows.getFirst();
     }
 
     private void ensureTarget(long org, Kind kind, long id) {

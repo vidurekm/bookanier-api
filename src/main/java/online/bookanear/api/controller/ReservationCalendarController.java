@@ -27,13 +27,14 @@ public class ReservationCalendarController {
            @RequestParam LocalDate from,@RequestParam LocalDate to,
            @RequestParam(required=false) Long locationId,
            @RequestParam(required=false) String status,
+           @RequestParam(defaultValue="false") boolean showCancelled,
            @RequestParam(required=false) Long memberId,
            @RequestParam(required=false) Long resourceId,Authentication authentication) {
-        if (!from.isBefore(to) || to.toEpochDay()-from.toEpochDay()>32)
-            throw new ApiException(HttpStatus.BAD_REQUEST,"Choose a range of 1–32 days");
+        if (!from.isBefore(to) || to.toEpochDay()-from.toEpochDay()>42)
+            throw new ApiException(HttpStatus.BAD_REQUEST,"Choose a range of 1–42 days");
         var p=new MapSqlParameterSource().addValue("org",org).addValue("from",from).addValue("to",to)
                 .addValue("loc",locationId).addValue("status",status).addValue("member",memberId)
-                .addValue("resource",resourceId);
+                .addValue("resource",resourceId).addValue("showCancelled",showCancelled);
         if (status != null && !List.of("confirmed","pending","completed","cancelled","no_show").contains(status))
             throw new ApiException(HttpStatus.BAD_REQUEST,"Invalid reservation status");
         String own="";
@@ -49,6 +50,7 @@ public class ReservationCalendarController {
                              JOIN organization_members assigned ON assigned.id=res.member_id
                                AND assigned.organization_id=res.organization_id
                              WHERE rr.reservation_item_id=ri.id AND rr.organization_id=ri.organization_id
+                               AND (rr.active OR r.status='cancelled')
                                AND assigned.user_id=:user AND assigned.active=true)
                  )
                  """;
@@ -64,9 +66,12 @@ public class ReservationCalendarController {
                          SELECT string_agg(DISTINCT assigned.display_name, ', ')
                          FROM reservation_resources rr
                          JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id
+                         JOIN resource_types rt ON rt.organization_id=res.organization_id
+                           AND rt.id=res.resource_type_id AND rt.category='staff'
                          JOIN organization_members assigned ON assigned.id=res.member_id
                            AND assigned.organization_id=res.organization_id
                          WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                           AND (rr.active OR r.status='cancelled')
                        ),m.display_name) AS member_name,
                        (
                          SELECT string_agg(DISTINCT res.name, ', ' ORDER BY res.name)
@@ -86,6 +91,7 @@ public class ReservationCalendarController {
                 WHERE ri.organization_id=:org AND (ri.item_status='active' OR r.status='cancelled')
                   AND (CAST(:loc AS bigint) IS NULL OR ri.location_id=:loc)
                   AND (CAST(:status AS text) IS NULL OR r.status=:status)
+                  AND (CAST(:showCancelled AS boolean) OR r.status<>'cancelled')
                   AND (CAST(:member AS bigint) IS NULL OR ri.member_id=:member OR EXISTS (
                     SELECT 1 FROM reservation_resources worker_rr
                     JOIN resources worker_resource ON worker_resource.id=worker_rr.resource_id
@@ -95,11 +101,13 @@ public class ReservationCalendarController {
                       AND worker_type.category='staff'
                     WHERE worker_rr.organization_id=ri.organization_id
                       AND worker_rr.reservation_item_id=ri.id AND worker_resource.member_id=:member
+                      AND (worker_rr.active OR r.status='cancelled')
                   ))
                   AND (CAST(:resource AS bigint) IS NULL OR EXISTS (
                     SELECT 1 FROM reservation_resources filtered_rr
                     WHERE filtered_rr.organization_id=ri.organization_id
                       AND filtered_rr.reservation_item_id=ri.id AND filtered_rr.resource_id=:resource
+                      AND (filtered_rr.active OR r.status='cancelled')
                   ))
                   AND ri.starts_at < (CAST(:to AS date)::timestamp AT TIME ZONE l.timezone)
                   AND ri.ends_at > (CAST(:from AS date)::timestamp AT TIME ZONE l.timezone)

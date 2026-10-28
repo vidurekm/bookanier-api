@@ -57,8 +57,9 @@ app:
     password-reset:
       minutes: ${PASSWORD_RESET_MINUTES:30}
   ai-help:
-    api-key: ${OPENAI_API_KEY:}
-    model: ${OPENAI_MODEL:gpt-4o-mini}
+    api-key: ${AI_HELP_API_KEY:${OPENAI_API_KEY:}}
+    model: ${AI_HELP_MODEL:${OPENAI_MODEL:gpt-4o-mini}}
+    base-url: ${AI_HELP_BASE_URL:https://api.openai.com/v1}
 
 springdoc:
   swagger-ui:

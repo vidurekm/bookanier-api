@@ -247,11 +247,11 @@ public class BackofficeController {
 
     @PutMapping("/{org}/locations/{id}/opening-hours")
     @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
-    @Operation(summary = "Replace weekly opening hours", description = "Replace the regular opening intervals. Use dryRun to preview conflicts; explicit confirmation is required to cancel affected reservations.")
+    @Operation(summary = "Replace weekly opening hours", description = "Replace the regular opening intervals. Use dryRun to preview conflicts. Changes affecting existing bookings are rejected; bookings are never automatically cancelled.")
     public Object replaceOpeningHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id,
             @Valid @RequestBody BackofficeDto.WeeklySchedule request,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.replaceWeeklySchedule(org, id, null, "open", request, dryRun, cancelConflictingReservations);
     }
 
@@ -268,7 +268,7 @@ public class BackofficeController {
     public Object replaceWorkingHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id, @Parameter(description = "Identifier of the organization member.") @PathVariable long memberId,
             @Valid @RequestBody BackofficeDto.WeeklySchedule request,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.replaceWeeklySchedule(org, id, memberId, "working", request, dryRun, cancelConflictingReservations);
     }
 
@@ -286,7 +286,7 @@ public class BackofficeController {
     public Object putDatedOpeningHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id,
             @Valid @RequestBody BackofficeDto.DatedSchedule request,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.replaceDatedSchedule(org, id, null, "open", request, dryRun, cancelConflictingReservations);
     }
 
@@ -304,7 +304,7 @@ public class BackofficeController {
     public Object putDatedWorkingHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id, @Parameter(description = "Identifier of the organization member.") @PathVariable long memberId,
             @Valid @RequestBody BackofficeDto.DatedSchedule request,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.replaceDatedSchedule(org, id, memberId, "working", request, dryRun, cancelConflictingReservations);
     }
 
@@ -314,7 +314,7 @@ public class BackofficeController {
     public Object deleteDatedWorkingHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id, @Parameter(description = "Identifier of the organization member.") @PathVariable long memberId,
             @Parameter(description = "Calendar date in ISO 8601 format (YYYY-MM-DD).") @PathVariable java.time.LocalDate date,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.deleteDatedSchedule(org, id, memberId, "working", date, dryRun, cancelConflictingReservations);
     }
 
@@ -324,7 +324,7 @@ public class BackofficeController {
     public Object deleteDatedOpeningHours(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Internal identifier of the resource in the URL.") @PathVariable long id,
             @Parameter(description = "Calendar date in ISO 8601 format (YYYY-MM-DD).") @PathVariable java.time.LocalDate date,
             @Parameter(description = "If true, preview schedule conflicts without saving any changes.") @RequestParam(defaultValue="false") boolean dryRun,
-            @Parameter(description = "If true, explicitly confirm cancellation of eligible conflicting reservations.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
+            @Parameter(description = "Legacy parameter; conflicting bookings are never automatically cancelled.") @RequestParam(defaultValue="false") boolean cancelConflictingReservations) {
         return service.deleteDatedSchedule(org, id, null, "open", date, dryRun, cancelConflictingReservations);
     }
 
@@ -436,27 +436,30 @@ public class BackofficeController {
 
     @GetMapping("/{org}/reservations")
     @PreAuthorize("@organizationSecurity.canRead(#p0, authentication)")
-    @Operation(summary = "Search reservations", description = "Filter reservations by location, status, customer, worker, or resource and paginate results. Worker visibility is limited by authorization.")
+    @Operation(summary = "Search reservations", description = "Filter reservations by appointment date, location, status, customer, worker, or resource and paginate results. Worker visibility is limited by authorization.")
     public Object reservations(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org, @Parameter(description = "Filter by location identifier.") @RequestParam(required=false) Long locationId, Authentication authentication,
             @Parameter(description = "Filter by status.") @RequestParam(required=false) String status,
             @Parameter(description = "Include only reservations with an active booking item starting in the future.") @RequestParam(defaultValue="false") boolean upcomingOnly,
             @Parameter(description = "Filter by assigned worker identifier.") @RequestParam(required=false) Long memberId,
             @Parameter(description = "Filter by assigned non-staff resource identifier.") @RequestParam(required=false) Long resourceId,
+            @Parameter(description = "Filter by appointment start date (inclusive), in the appointment location's timezone.") @RequestParam(required=false) java.time.LocalDate appointmentFrom,
+            @Parameter(description = "Filter by appointment start date (inclusive), in the appointment location's timezone.") @RequestParam(required=false) java.time.LocalDate appointmentTo,
             @Parameter(description = "Start of the filter range (inclusive); use ISO 8601 format.") @RequestParam(required=false) java.time.OffsetDateTime from,
             @Parameter(description = "End of the filter range (inclusive); use ISO 8601 format.") @RequestParam(required=false) java.time.OffsetDateTime to,
             @Parameter(description = "Zero-based page index.") @RequestParam(defaultValue="0") int page, @Parameter(description = "Page size; the server caps the maximum number of records.") @RequestParam(defaultValue="20") int size,
-            @Parameter(description = "Search by customer name or email.") @RequestParam(required=false) String q, @Parameter(description = "Sort by one supported field and direction, for example name,asc or id,desc.") @RequestParam(defaultValue="createdAt,desc") String sort) {
-        return service.reservations(org, locationId, authentication, status, upcomingOnly, memberId, resourceId, from, to, page, size, q, sort);
+            @Parameter(description = "Search by customer name or email.") @RequestParam(required=false) String q, @Parameter(description = "Sort by appointment time, customer, worker, resource, status, or amount.") @RequestParam(defaultValue="appointmentAt,desc") String sort) {
+        return service.reservations(org, locationId, authentication, status, upcomingOnly, memberId, resourceId, appointmentFrom, appointmentTo, from, to, page, size, q, sort);
     }
 
     @GetMapping("/{org}/members")
     @PreAuthorize("@organizationSecurity.canWrite(#p0, authentication)")
-    @Operation(summary = "Search organization members", description = "Filter, sort and paginate members of the organization.")
+    @Operation(summary = "Search organization members", description = "Filter, sort and paginate organization members, optionally by assigned location.")
     public Object members(@Parameter(description = "Internal identifier of the organization; access is restricted to the current tenant.") @PathVariable long org,
+            @Parameter(description = "Filter by assigned location identifier.") @RequestParam(required=false) Long locationId,
             @Parameter(description = "Filter by name (case-insensitive partial match).") @RequestParam(required=false) String name, @Parameter(description = "Filter by organization member role (owner, admin or worker).") @RequestParam(required=false) String role,
             @Parameter(description = "Zero-based page index.") @RequestParam(defaultValue="0") int page, @Parameter(description = "Page size; the server caps the maximum number of records.") @RequestParam(defaultValue="20") int size,
             @Parameter(description = "Keyword search across the supported text columns.") @RequestParam(required=false) String q, @Parameter(description = "Sort by one supported field and direction, for example name,asc or id,desc.") @RequestParam(defaultValue="id,asc") String sort) {
-        return service.members(org, name, role, page, size, q, sort);
+        return service.members(org, locationId, name, role, page, size, q, sort);
     }
 
     @GetMapping("/{org}/services")

@@ -13,6 +13,8 @@ import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
 import java.util.Map;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashMap;
 
 /**
  * Backoffice API. Every mapped endpoint has tenant-aware method authorization.
@@ -26,14 +28,17 @@ public class BackofficeService {
     private final MemberScheduleConflictValidator memberScheduleConflictValidator;
     private final OrganizationDeletionService organizationDeletionService;
     private final StaffResourceService staffResourceService;
+    private final ReservationNotificationService reservationNotifications;
     public BackofficeService(NamedParameterJdbcTemplate db, OrganizationSecurity organizationSecurity,
                              MemberScheduleConflictValidator memberScheduleConflictValidator,
                              OrganizationDeletionService organizationDeletionService,
-                             StaffResourceService staffResourceService) {
+                             StaffResourceService staffResourceService,
+                             ReservationNotificationService reservationNotifications) {
         this.db=db; this.organizationSecurity=organizationSecurity;
         this.memberScheduleConflictValidator=memberScheduleConflictValidator;
         this.organizationDeletionService=organizationDeletionService;
         this.staffResourceService=staffResourceService;
+        this.reservationNotifications=reservationNotifications;
     }
     private Map<String, Object> one(String sql, Map<String, ?> params) {
         var result = db.queryForList(sql, params);
@@ -280,7 +285,7 @@ public class BackofficeService {
                 SELECT req.resource_type_id,rt.code AS resource_type,rt.name AS resource_type_name,rt.category,
                        req.quantity,req.min_capacity
                 FROM service_resource_requirements req
-                JOIN resource_types rt ON rt.id=req.resource_type_id AND rt.organization_id=s.organization_id
+                JOIN resource_types rt ON rt.id=req.resource_type_id
                 WHERE req.service_id=:service AND rt.organization_id=:org
                 ORDER BY rt.name
                 """, Map.of("org", org, "service", serviceId));
@@ -290,8 +295,8 @@ public class BackofficeService {
         service(org, serviceId);
         return one("""
                 SELECT s.customer_can_choose_staff,s.customer_can_choose_resource,
-                       COALESCE((SELECT req.quantity FROM service_resource_requirements req
-                           JOIN resource_types rt ON rt.id=req.resource_type_id
+                       COALESCE((SELECT SUM(req.quantity) FROM service_resource_requirements req
+                           JOIN resource_types rt ON rt.id=req.resource_type_id AND rt.active
                            WHERE req.service_id=s.id AND rt.category='staff'),1) AS required_staff_count
                 FROM services s WHERE s.organization_id=:org AND s.id=:id
                 """, p(org, serviceId));
@@ -419,6 +424,8 @@ public class BackofficeService {
     @Transactional
     public Object updateLocation(long org, long id, BackofficeDto.LocationUpsert r) {
         checkCoordinates(r.latitude(), r.longitude());
+        lockScheduleOrganization(org);
+        if (!r.active()) requireLocationWithoutActiveReservations(org, id);
         var a = new MapSqlParameterSource().addValue("org", org).addValue("id", id).addValue("name", r.name()).addValue("address", r.address()).addValue("tz", r.timezone()).addValue("active", r.active()).addValue("latitude", r.latitude()).addValue("longitude", r.longitude());
         return one("update locations set name=:name,address=:address,timezone=:tz,active=:active,latitude=:latitude,longitude=:longitude where organization_id=:org and id=:id and archived_at is null returning *", a.getValues());
     }
@@ -432,6 +439,14 @@ public class BackofficeService {
                 FOR UPDATE
                 """, Map.of("org", org, "id", id)).isEmpty())
             throw new ApiException(HttpStatus.NOT_FOUND, "NOT_FOUND", "Location not found");
+        requireLocationWithoutActiveReservations(org, id);
+        db.update("""
+                UPDATE locations SET active=false,archived_at=now()
+                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
+                """, Map.of("org", org, "id", id));
+    }
+
+    private void requireLocationWithoutActiveReservations(long org, long id) {
         boolean hasFutureReservations = Boolean.TRUE.equals(db.queryForObject("""
                 SELECT EXISTS (
                     SELECT 1
@@ -439,23 +454,19 @@ public class BackofficeService {
                     JOIN reservations r ON r.id=ri.reservation_id AND r.organization_id=ri.organization_id
                     WHERE ri.organization_id=:org AND ri.location_id=:id
                       AND ri.item_status='active' AND r.status IN ('confirmed','pending')
-                      AND ri.starts_at>now()
+                      AND ri.ends_at>now()
                 ) OR EXISTS (
                     SELECT 1
                     FROM event_occurrences eo
                     JOIN event_series es ON es.id=eo.series_id AND es.organization_id=eo.organization_id
                     JOIN event_registrations er ON er.occurrence_id=eo.id AND er.organization_id=eo.organization_id
                     WHERE eo.organization_id=:org AND es.location_id=:id
-                      AND eo.status='scheduled' AND eo.starts_at>now() AND er.status='confirmed'
+                      AND eo.status='scheduled' AND eo.ends_at>now() AND er.status='confirmed'
                 )
                 """, Map.of("org", org, "id", id), Boolean.class));
         if (hasFutureReservations)
             throw new ApiException(HttpStatus.CONFLICT, "LOCATION_HAS_ACTIVE_RESERVATIONS",
-                    "Cancel future reservations and event registrations before archiving this location");
-        db.update("""
-                UPDATE locations SET active=false,archived_at=now()
-                WHERE organization_id=:org AND id=:id AND archived_at IS NULL
-                """, Map.of("org", org, "id", id));
+                    "Move or cancel active reservations and event registrations before closing this location");
     }
 
     public Object member(long org, long id) {
@@ -502,7 +513,7 @@ public class BackofficeService {
                     JOIN reservations r ON r.id=ri.reservation_id AND r.organization_id=ri.organization_id
                     WHERE ri.organization_id=:org AND ri.member_id=:id
                       AND ri.item_status='active' AND r.status IN ('confirmed','pending')
-                      AND ri.starts_at>now()
+                      AND ri.ends_at>now()
                 )
                 """, Map.of("org", org, "id", id), Boolean.class));
         if (hasFutureReservations)
@@ -563,8 +574,13 @@ public class BackofficeService {
 
     public Object reservation(long org, long id, Authentication authentication) {
         var head = one("select * from reservations where organization_id=:org and id=:id", p(org, id));
+        boolean resourcesEnabled = Boolean.TRUE.equals(db.queryForObject("""
+                SELECT COALESCE((SELECT (settings->>'trackResources')::boolean
+                FROM organization_booking_config WHERE organization_id=:org),false)
+                """, Map.of("org",org), Boolean.class));
         var items = db.queryForList("""
-                SELECT ri.*,s.name AS service_name
+                SELECT ri.*,s.name AS service_name,
+                  (SELECT l.name FROM locations l WHERE l.organization_id=ri.organization_id AND l.id=ri.location_id) AS location_name
                 FROM reservation_items ri
                 JOIN services s ON s.organization_id=ri.organization_id AND s.id=ri.service_id
                 WHERE ri.organization_id=:org AND ri.reservation_id=:id
@@ -572,10 +588,12 @@ public class BackofficeService {
                 """, p(org, id));
         boolean canManage = organizationSecurity.canManageReservation(org, id, authentication);
         if (organizationSecurity.canManageBookings(org, authentication)) {
-            return Map.of("reservation", head, "items", items, "canManage", canManage);
+            return reservationDetails(org, head, items, canManage, resourcesEnabled);
         }
         var ownItems = db.queryForList("""
-                SELECT ri.*,s.name AS service_name FROM reservation_items ri
+                SELECT ri.*,s.name AS service_name,
+                  (SELECT l.name FROM locations l WHERE l.organization_id=ri.organization_id AND l.id=ri.location_id) AS location_name
+                FROM reservation_items ri
                 JOIN services s ON s.organization_id=ri.organization_id AND s.id=ri.service_id
                 WHERE ri.organization_id=:org AND ri.reservation_id=:id AND (
                   EXISTS (SELECT 1 FROM organization_members m WHERE m.organization_id=ri.organization_id
@@ -584,10 +602,91 @@ public class BackofficeService {
                     JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id
                     JOIN organization_members m ON m.id=res.member_id AND m.organization_id=res.organization_id
                     WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
-                    AND m.user_id=:user AND m.active=true)
+                    AND m.user_id=:user AND m.active=true
+                    AND (rr.active OR EXISTS (SELECT 1 FROM reservations cancelled
+                      WHERE cancelled.organization_id=ri.organization_id
+                        AND cancelled.id=ri.reservation_id AND cancelled.status='cancelled')))
                 ) ORDER BY ri.starts_at
                 """, Map.of("org",org,"id",id,"user",organizationSecurity.authenticatedUserId(authentication)));
-        return Map.of("reservation", head, "items", ownItems, "canManage", canManage);
+        return reservationDetails(org, head, ownItems, canManage, resourcesEnabled);
+    }
+
+    private Map<String, Object> reservationDetails(long org, Map<String, Object> head,
+                                                   List<Map<String, Object>> items, boolean canManage,
+                                                   boolean resourcesEnabled) {
+        var detailedItems = new ArrayList<Map<String, Object>>();
+        for (var item : items) {
+            var detailed = new HashMap<String, Object>(item);
+            detailedItems.add(detailed);
+        }
+        if (!items.isEmpty()) {
+            var itemIds = items.stream().map(item -> ((Number) item.get("id")).longValue()).toList();
+            var assignedWorkers = db.queryForList("""
+                    SELECT ri.id AS reservation_item_id,m.display_name
+                    FROM reservation_items ri
+                    JOIN organization_members m ON m.organization_id=ri.organization_id AND m.id=ri.member_id
+                    WHERE ri.organization_id=:org AND ri.id IN (:items)
+                    UNION
+                    SELECT rr.reservation_item_id,m.display_name
+                    FROM reservation_resources rr
+                    JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id
+                    JOIN resource_types rt ON rt.organization_id=res.organization_id
+                      AND rt.id=res.resource_type_id AND rt.category='staff'
+                    JOIN organization_members m ON m.organization_id=res.organization_id AND m.id=res.member_id
+                    WHERE rr.organization_id=:org AND rr.reservation_item_id IN (:items)
+                      AND (rr.active OR :includeInactive)
+                    ORDER BY display_name
+                    """, Map.of("org", org, "items", itemIds,
+                    "includeInactive", "cancelled".equals(head.get("status"))));
+            var workersByItem = new HashMap<Long, List<String>>();
+            for (var worker : assignedWorkers) {
+                long itemId = ((Number) worker.get("reservation_item_id")).longValue();
+                workersByItem.computeIfAbsent(itemId, ignored -> new ArrayList<>())
+                        .add(worker.get("display_name").toString());
+            }
+            for (var item : detailedItems) {
+                item.put("member_name", String.join(", ", workersByItem.getOrDefault(
+                        ((Number) item.get("id")).longValue(), List.of())));
+            }
+        }
+        if (!items.isEmpty()) {
+            var itemIds = items.stream().map(item -> ((Number) item.get("id")).longValue()).toList();
+            var assignable = db.queryForList("""
+                    SELECT ri.id FROM reservation_items ri
+                    WHERE ri.organization_id=:org AND ri.id IN (:items) AND EXISTS (
+                      SELECT 1 FROM service_resource_requirements req
+                      JOIN resource_types rt ON rt.organization_id=:org AND rt.id=req.resource_type_id
+                        AND rt.active AND rt.category<>'staff'
+                      WHERE req.service_id=ri.service_id)
+                    """, Map.of("org", org, "items", itemIds)).stream()
+                    .map(row -> ((Number) row.get("id")).longValue()).collect(java.util.stream.Collectors.toSet());
+            for (var item : detailedItems)
+                item.put("can_assign_resource", assignable.contains(((Number) item.get("id")).longValue()));
+        }
+        if (!items.isEmpty()) {
+            var itemIds = items.stream().map(item -> ((Number) item.get("id")).longValue()).toList();
+            var assignedResources = db.queryForList("""
+                    SELECT rr.reservation_item_id,res.name
+                    FROM reservation_resources rr
+                    JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id
+                    JOIN resource_types rt ON rt.organization_id=res.organization_id
+                      AND rt.id=res.resource_type_id AND rt.category<>'staff'
+                    WHERE rr.organization_id=:org AND rr.reservation_item_id IN (:items) AND rr.active
+                    ORDER BY res.name
+                    """, Map.of("org", org, "items", itemIds));
+            var namesByItem = new HashMap<Long, List<String>>();
+            for (var resource : assignedResources) {
+                long itemId = ((Number) resource.get("reservation_item_id")).longValue();
+                namesByItem.computeIfAbsent(itemId, ignored -> new ArrayList<>())
+                        .add(resource.get("name").toString());
+            }
+            for (var item : detailedItems) {
+                item.put("resources", namesByItem.getOrDefault(
+                        ((Number) item.get("id")).longValue(), List.of()));
+            }
+        }
+        return Map.of("reservation", head, "items", detailedItems, "canManage", canManage,
+                "resourcesEnabled", resourcesEnabled);
     }
 
     public Object schedule(long org, long id, Authentication authentication, java.time.LocalDate from, java.time.LocalDate to) {
@@ -808,7 +907,7 @@ public class BackofficeService {
 
     /**
      * Preview is transactionally rolled back. Normal edits fail with 409 if any
-     * booking would be invalidated, unless cancellation was explicitly requested.
+     * booking would be invalidated. Existing bookings are never cancelled here.
      */
     private Object finishScheduleChange(long org, long locationId, Long memberId, String kind,
                                         boolean dryRun, boolean cancelConflictingReservations) {
@@ -828,29 +927,9 @@ public class BackofficeService {
             return Map.of("dryRun", true, "conflictCount", reservationIds.size(),
                     "conflicts", conflicts, "autoCancellationBlockedIds", cannotCancel);
         }
-        if (!reservationIds.isEmpty() && !cancelConflictingReservations)
+        if (!reservationIds.isEmpty())
             throw new ScheduleConflictException(conflicts,
-                    "Schedule change conflicts with existing reservations. Preview with dryRun=true, "
-                    + "or explicitly set cancelConflictingReservations=true.");
-        if (!cannotCancel.isEmpty())
-            throw new ScheduleConflictException(conflicts,
-                    "Some affected reservations have payments or group attendance and require manual handling.");
-        for (long id : reservationIds) {
-            var args = new MapSqlParameterSource().addValue("org",org).addValue("id",id)
-                    .addValue("kind",kind).addValue("loc",locationId).addValue("member",memberId);
-            int changed = db.update("""
-                UPDATE reservations SET status='cancelled'
-                WHERE organization_id=:org AND id=:id AND status IN ('confirmed','pending')
-                """, args);
-            if (changed != 1)
-                throw new ApiException(HttpStatus.CONFLICT, "Reservation changed concurrently: " + id);
-            // Existing DB trigger cancels reservation_items and releases resources.
-            db.update("""
-                INSERT INTO reservation_events(reservation_id,event_type,details)
-                VALUES (:id,'cancelled_by_schedule_change',
-                    jsonb_build_object('kind',:kind,'locationId',:loc,'memberId',:member))
-                """, args);
-        }
+                    "Schedule change conflicts with existing reservations. Move or cancel affected bookings manually first.");
         return Map.of("dryRun", false, "conflictCount", reservationIds.size(),
                 "cancelledReservationIds", reservationIds, "conflicts", conflicts);
     }
@@ -1073,7 +1152,9 @@ public class BackofficeService {
                 SELECT r.id,r.customer_name,r.customer_email,r.customer_phone,r.status,
                        r.total_amount,r.currency,r.created_at,
                        (SELECT MIN(ri.starts_at) FROM reservation_items ri
-                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_at
+                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_at,
+                       (SELECT MAX(ri.ends_at) FROM reservation_items ri
+                        WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id) AS appointment_ends_at
                 FROM reservations r
                 WHERE r.organization_id=:org
                   AND ((CAST(:email AS text) IS NULL AND r.id=:id)
@@ -1095,13 +1176,18 @@ public class BackofficeService {
     }
 
     public Object reservations(long org, Long locationId, Authentication authentication,
-            String status, boolean upcomingOnly, Long memberId, Long resourceId, java.time.OffsetDateTime from, java.time.OffsetDateTime to,
+            String status, boolean upcomingOnly, Long memberId, Long resourceId,
+            java.time.LocalDate appointmentFrom, java.time.LocalDate appointmentTo,
+            java.time.OffsetDateTime from, java.time.OffsetDateTime to,
             int page, int size, String q, String sort) {
         validatePeriod(from, to);
+        if (appointmentFrom != null && appointmentTo != null && appointmentFrom.isAfter(appointmentTo))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "appointmentFrom must be on or before appointmentTo");
         if (locationId != null) location(org, locationId);
         var params = pageParams(page, size).addValue("org", org).addValue("loc", locationId)
                 .addValue("status", blankToNull(status)).addValue("upcomingOnly", upcomingOnly)
                 .addValue("member", memberId).addValue("resource", resourceId)
+                .addValue("appointmentFrom", appointmentFrom).addValue("appointmentTo", appointmentTo)
                 .addValue("from", from).addValue("to", to)
                 .addValue("q", searchTokens(q));
         String where = " FROM reservations r WHERE r.organization_id=:org "
@@ -1116,6 +1202,7 @@ public class BackofficeService {
                 + " JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id"
                 + " JOIN resource_types rt ON rt.id=res.resource_type_id AND rt.organization_id=res.organization_id"
                 + " WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id"
+                + " AND (rr.active OR r.status='cancelled') "
                 + " AND rt.category='staff' AND res.member_id=:member)))) "
                 + " AND (CAST(:resource AS bigint) IS NULL OR EXISTS ("
                 + " SELECT 1 FROM reservation_items ri JOIN reservation_resources rr"
@@ -1123,9 +1210,23 @@ public class BackofficeService {
                 + " JOIN resources res ON res.organization_id=rr.organization_id AND res.id=rr.resource_id"
                 + " JOIN resource_types rt ON rt.organization_id=res.organization_id AND rt.id=res.resource_type_id"
                 + " WHERE ri.organization_id=r.organization_id AND ri.reservation_id=r.id"
-                + " AND res.id=:resource AND rt.category<>'staff')) "
+                + " AND res.id=:resource AND rt.category<>'staff' AND (rr.active OR r.status='cancelled'))) "
                 + " AND (CAST(:from AS timestamptz) IS NULL OR r.created_at >= CAST(:from AS timestamptz)) "
                 + " AND (CAST(:to AS timestamptz) IS NULL OR r.created_at < CAST(:to AS timestamptz)) ";
+        where += """
+                 AND (CAST(:appointmentFrom AS date) IS NULL AND CAST(:appointmentTo AS date) IS NULL
+                      OR EXISTS (
+                          SELECT 1 FROM reservation_items date_item
+                          JOIN locations date_location ON date_location.organization_id=date_item.organization_id
+                            AND date_location.id=date_item.location_id
+                          WHERE date_item.organization_id=r.organization_id
+                            AND date_item.reservation_id=r.id
+                            AND (CAST(:appointmentFrom AS date) IS NULL
+                                 OR (date_item.starts_at AT TIME ZONE date_location.timezone)::date >= CAST(:appointmentFrom AS date))
+                            AND (CAST(:appointmentTo AS date) IS NULL
+                                 OR (date_item.starts_at AT TIME ZONE date_location.timezone)::date <= CAST(:appointmentTo AS date))
+                      ))
+                """;
         where += """
                  AND (CAST(:q AS text[]) IS NULL OR NOT EXISTS (
                      SELECT 1 FROM unnest(CAST(:q AS text[])) AS search_token(value)
@@ -1145,7 +1246,8 @@ public class BackofficeService {
                     + " JOIN resources res ON res.id=rr.resource_id AND res.organization_id=rr.organization_id "
                     + " JOIN organization_members m ON m.id=res.member_id AND m.organization_id=res.organization_id "
                     + " WHERE rr.reservation_item_id=ri.id AND rr.organization_id=ri.organization_id "
-                    + " AND m.user_id=:user AND m.active=true))) ";
+                    + " AND m.user_id=:user AND m.active=true "
+                    + " AND (rr.active OR r.status='cancelled')))) ";
         }
         return paged("""
                 SELECT r.id,r.customer_name,r.status,r.total_amount,r.currency,r.created_at,
@@ -1173,6 +1275,7 @@ public class BackofficeService {
                             AND assigned.id=res.member_id
                           WHERE assigned_item.organization_id=r.organization_id
                             AND assigned_item.reservation_id=r.id AND res.member_id IS NOT NULL
+                            AND (rr.active OR r.status='cancelled')
                         ) worker_names) AS member_name,
                        (SELECT string_agg(DISTINCT res.name, ', ' ORDER BY res.name)
                         FROM reservation_items resource_item
@@ -1182,22 +1285,27 @@ public class BackofficeService {
                         JOIN resource_types rt ON rt.organization_id=res.organization_id
                           AND rt.id=res.resource_type_id AND rt.category<>'staff'
                         WHERE resource_item.organization_id=r.organization_id
-                          AND resource_item.reservation_id=r.id) AS resource_name
+                          AND resource_item.reservation_id=r.id
+                          AND (rr.active OR r.status='cancelled')) AS resource_name
                 """,
-                where, sortOrder(sort, Map.of("id", "r.id", "createdAt", "r.created_at", "status", "r.status", "customerName", "r.customer_name"), "r.id"), params, page, size);
+                where, sortOrder(sort, Map.of("id", "r.id", "appointmentAt", "appointment_at",
+                        "createdAt", "r.created_at", "status", "r.status", "customerName", "r.customer_name",
+                        "memberName", "member_name", "resourceName", "resource_name", "amount", "r.total_amount"),
+                        "r.id"), params, page, size);
     }
 
-    public Object members(long org, String name, String role, int page, int size, String q, String sort) {
+    public Object members(long org, Long locationId, String name, String role, int page, int size, String q, String sort) {
         if (role != null && !role.isBlank() && !List.of("owner", "admin", "worker").contains(role))
             throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid role");
         var params = pageParams(page, size).addValue("org", org)
-                .addValue("name", contains(name)).addValue("role", blankToNull(role)).addValue("q", contains(q));
+                .addValue("locationId", locationId).addValue("name", contains(name)).addValue("role", blankToNull(role)).addValue("q", contains(q));
         String where = " FROM organization_members m LEFT JOIN users u ON u.id=m.user_id WHERE m.organization_id=:org AND m.archived_at IS NULL "
+                + " AND (CAST(:locationId AS bigint) IS NULL OR EXISTS (SELECT 1 FROM member_locations ml WHERE ml.organization_id=m.organization_id AND ml.member_id=m.id AND ml.location_id=:locationId)) "
                 + " AND (CAST(:name AS text) IS NULL OR m.display_name ILIKE :name ESCAPE '\\') "
                 + " AND (CAST(:role AS text) IS NULL OR m.role=:role) ";
         where += " AND (CAST(:q AS text) IS NULL OR m.display_name ILIKE :q ESCAPE '\\' OR m.role ILIKE :q ESCAPE '\\' OR u.email ILIKE :q ESCAPE '\\') ";
         return paged("SELECT m.id,m.user_id,u.email,m.display_name,m.role,m.active,m.provides_services,m.can_manage_bookings,m.can_manage_own_bookings,m.can_approve_own_absence", where,
-                sortOrder(sort, Map.of("id", "m.id", "name", "m.display_name", "role", "m.role", "active", "m.active"), "m.id"), params, page, size);
+                sortOrder(sort, Map.of("id", "m.id", "name", "m.display_name", "email", "u.email", "role", "m.role", "active", "m.active"), "m.id"), params, page, size);
     }
 
     public Object services(long org, String name, Boolean active, int page, int size, String q, String sort) {
@@ -1208,7 +1316,7 @@ public class BackofficeService {
                 + " AND (CAST(:active AS boolean) IS NULL OR s.active=:active) ";
         where += " AND (CAST(:q AS text) IS NULL OR s.name ILIKE :q ESCAPE '\\' OR s.description ILIKE :q ESCAPE '\\') ";
         return paged("SELECT s.id,s.name,s.description,s.active", where,
-                sortOrder(sort, Map.of("id", "s.id", "name", "s.name", "active", "s.active"), "s.id"), params, page, size);
+                sortOrder(sort, Map.of("id", "s.id", "name", "s.name", "description", "s.description", "active", "s.active"), "s.id"), params, page, size);
     }
 
     public Object locations(long org, String name, Boolean active, int page, int size, String q, String sort) {
@@ -1219,7 +1327,7 @@ public class BackofficeService {
                 + " AND (CAST(:active AS boolean) IS NULL OR l.active=:active) ";
         where += " AND (CAST(:q AS text) IS NULL OR l.name ILIKE :q ESCAPE '\\' OR l.address ILIKE :q ESCAPE '\\' OR l.timezone ILIKE :q ESCAPE '\\') ";
         return paged("SELECT l.id,l.name,l.address,l.timezone,l.active,l.latitude,l.longitude", where,
-                sortOrder(sort, Map.of("id", "l.id", "name", "l.name", "active", "l.active"), "l.id"), params, page, size);
+                sortOrder(sort, Map.of("id", "l.id", "name", "l.name", "address", "l.address", "timezone", "l.timezone", "active", "l.active"), "l.id"), params, page, size);
     }
 
     public Object users(String q, String name, String email, Boolean verified, Boolean superadmin,

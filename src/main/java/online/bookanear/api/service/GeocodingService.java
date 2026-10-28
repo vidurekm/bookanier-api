@@ -43,7 +43,7 @@ public class GeocodingService {
         }
     };
     private record Cached(long epochMs, List<Result> results) {}
-    public record Result(String address, double latitude, double longitude) {}
+    public record Result(String address, double latitude, double longitude, Map<String, String> addressDetails) {}
 
     public GeocodingService(ObjectMapper mapper,
             @Value("${app.geocoding.enabled:false}") boolean enabled,
@@ -69,14 +69,16 @@ public class GeocodingService {
         lastExternalRequest=now;
         try {
             URI uri=URI.create(endpoint + (endpoint.contains("?") ? "&" : "?") +
-                "format=jsonv2&limit=4&q="+URLEncoder.encode(normalized,StandardCharsets.UTF_8));
+                "format=jsonv2&addressdetails=1&limit=4&q="+URLEncoder.encode(normalized,StandardCharsets.UTF_8));
             // endpoint is operator-controlled config, never caller-controlled: avoids SSRF.
             var request=HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(8))
                 .header("User-Agent",userAgent).header("Accept","application/json")
                 .GET().build();
             var response=client.send(request,HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            if (response.statusCode()!=200)
+            if (response.statusCode()!=200) {
+                log.warn("[GEOCODING] Provider returned HTTP status {}", response.statusCode());
                 throw new ApiException(HttpStatus.BAD_GATEWAY,"GEOCODING_UNAVAILABLE","Geocoding provider temporarily unavailable");
+            }
             JsonNode root=mapper.readTree(response.body());
             if (!root.isArray()) throw new IllegalStateException("Not an array");
             var list=new ArrayList<Result>();
@@ -84,8 +86,12 @@ public class GeocodingService {
                 double lat=Double.parseDouble(row.path("lat").asText());
                 double lon=Double.parseDouble(row.path("lon").asText());
                 String name=row.path("display_name").asText();
+                var details = new LinkedHashMap<String, String>();
+                row.path("address").fields().forEachRemaining(field -> {
+                    if (field.getValue().isTextual()) details.put(field.getKey(), field.getValue().asText());
+                });
                 if (!name.isBlank() && Double.isFinite(lat) && Double.isFinite(lon) &&
-                    Math.abs(lat)<=90 && Math.abs(lon)<=180) list.add(new Result(name,lat,lon));
+                    Math.abs(lat)<=90 && Math.abs(lon)<=180) list.add(new Result(name,lat,lon,Map.copyOf(details)));
             }
             var results=List.copyOf(list);
             cache.put(key,new Cached(now,results));

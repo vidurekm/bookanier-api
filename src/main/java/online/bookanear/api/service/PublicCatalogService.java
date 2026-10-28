@@ -37,8 +37,8 @@ public class PublicCatalogService {
                 SELECT s.id,s.name,s.description,sv.duration_minutes,sv.slot_interval_minutes,
                        sv.price,sv.currency,sv.duration_mode,sv.max_duration_minutes,
                        s.customer_can_choose_staff,s.customer_can_choose_resource,
-                       COALESCE((SELECT req.quantity FROM service_resource_requirements req
-                           JOIN resource_types rt ON rt.id=req.resource_type_id
+                       COALESCE((SELECT SUM(req.quantity) FROM service_resource_requirements req
+                           JOIN resource_types rt ON rt.id=req.resource_type_id AND rt.active
                            WHERE req.service_id=s.id AND rt.category='staff'),1) AS required_staff_count
                 FROM services s JOIN service_versions sv ON sv.service_id=s.id
                 WHERE s.organization_id=:org AND s.active=true
@@ -78,8 +78,61 @@ public class PublicCatalogService {
     }
 
     public Map<String,Object> slots(UUID publicId, long locationId, long serviceId,
-                                     LocalDate date, Integer partySize, Integer quantity) {
-        var org = organization(publicId);
+                                     LocalDate date, Integer partySize, Integer quantity,
+                                     List<Long> preferredMemberIds, Long preferredResourceId) {
+        return slots(organization(publicId), locationId, serviceId, date, partySize, quantity,
+                preferredMemberIds, preferredResourceId, false);
+    }
+
+    /** Backoffice users may pick staff and resources regardless of the customer-facing service flags. */
+    public Map<String,Object> backofficeSlots(long orgId, long locationId, long serviceId,
+                                     LocalDate date, Integer partySize, Integer quantity,
+                                     List<Long> preferredMemberIds, Long preferredResourceId) {
+        return slots(backofficeOrganization(orgId), locationId, serviceId, date, partySize, quantity,
+                preferredMemberIds, preferredResourceId, true, 150);
+    }
+
+    /** Dates in the range (max 62 days) on which the service has no bookable start time. */
+    public List<String> backofficeUnavailableDays(long orgId, long locationId, long serviceId,
+                                                  LocalDate from, LocalDate to, Integer partySize, Integer quantity) {
+        if (to.isBefore(from) || from.plusDays(62).isBefore(to))
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid date range");
+        var org = backofficeOrganization(orgId);
+        var result = new ArrayList<String>();
+        for (var day = from; !day.isAfter(to); day = day.plusDays(1)) {
+            try {
+                var slots = (List<?>) slots(org, locationId, serviceId, day, partySize, quantity, null, null, true, 1).get("slots");
+                if (slots.isEmpty()) result.add(day.toString());
+            } catch (ApiException e) {
+                result.add(day.toString());
+            }
+        }
+        return result;
+    }
+
+    private Map<String,Object> backofficeOrganization(long orgId) {
+        var rows = db.queryForList("""
+                SELECT o.id,o.public_id,o.name,o.booking_enabled,
+                       COALESCE((c.settings->>'maxAdvanceDays')::integer,180) AS max_advance_days
+                FROM organizations o JOIN organization_booking_config c ON c.organization_id=o.id
+                WHERE o.id=:id AND o.registration_status='active'
+                """, Map.of("id", orgId));
+        if (rows.isEmpty()) throw new ApiException(HttpStatus.NOT_FOUND, "Organization not found");
+        return rows.getFirst();
+    }
+
+    private Map<String,Object> slots(Map<String,Object> org, long locationId, long serviceId,
+                                     LocalDate date, Integer partySize, Integer quantity,
+                                     List<Long> preferredMemberIds, Long preferredResourceId,
+                                     boolean backoffice) {
+        return slots(org, locationId, serviceId, date, partySize, quantity,
+                preferredMemberIds, preferredResourceId, backoffice, 150);
+    }
+
+    private Map<String,Object> slots(Map<String,Object> org, long locationId, long serviceId,
+                                     LocalDate date, Integer partySize, Integer quantity,
+                                     List<Long> preferredMemberIds, Long preferredResourceId,
+                                     boolean backoffice, int maxSlots) {
         long orgId = ((Number)org.get("id")).longValue();
         if (!Boolean.TRUE.equals(org.get("booking_enabled")))
             throw new ApiException(HttpStatus.CONFLICT, "Bookings are disabled");
@@ -92,7 +145,8 @@ public class PublicCatalogService {
             throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid quantity");
         var ctx = db.queryForList("""
                 SELECT l.timezone,sv.duration_minutes,sv.slot_interval_minutes,
-                       sv.buffer_before_minutes,sv.buffer_after_minutes,sv.duration_mode
+                       sv.buffer_before_minutes,sv.buffer_after_minutes,sv.duration_mode,
+                       s.customer_can_choose_staff,s.customer_can_choose_resource
                 FROM locations l JOIN location_services ls ON ls.location_id=l.id AND ls.active
                 JOIN services s ON s.id=ls.service_id AND s.organization_id=l.organization_id AND s.active
                 JOIN service_versions sv ON sv.service_id=s.id AND sv.valid_during @> CAST(:day AS date)
@@ -115,6 +169,22 @@ public class PublicCatalogService {
                 FROM service_resource_requirements rr JOIN resource_types rt ON rt.id=rr.resource_type_id AND rt.active
                 WHERE rr.service_id=:svc AND rt.organization_id=:org
                 """, Map.of("org",orgId,"svc",serviceId));
+        long staffCount = requirements.stream().filter(r -> "staff".equals(r.get("category")))
+                .mapToLong(r -> ((Number) r.get("quantity")).longValue()).sum();
+        long nonStaffCount = requirements.stream().filter(r -> !"staff".equals(r.get("category"))).count();
+        boolean canChooseStaff = backoffice || Boolean.TRUE.equals(version.get("customer_can_choose_staff"));
+        boolean canChooseResource = (backoffice || Boolean.TRUE.equals(version.get("customer_can_choose_resource")))
+                && nonStaffCount == 1 && requirements.stream()
+                .filter(r -> !"staff".equals(r.get("category")))
+                .allMatch(r -> ((Number) r.get("quantity")).intValue() == 1);
+        if (preferredMemberIds != null && !preferredMemberIds.isEmpty()) {
+            long expected = requirements.isEmpty() || staffCount == 0 ? 1 : staffCount;
+            if (!canChooseStaff || preferredMemberIds.size() != expected
+                    || preferredMemberIds.stream().distinct().count() != preferredMemberIds.size())
+                throw new ApiException(HttpStatus.BAD_REQUEST, "Invalid staff selection");
+        }
+        if (preferredResourceId != null && !canChooseResource)
+            throw new ApiException(HttpStatus.BAD_REQUEST, "Resource selection is disabled");
         if (quantity != null && requirements.stream().filter(r->!"staff".equals(r.get("category"))).count() != 1)
             throw new ApiException(HttpStatus.BAD_REQUEST, "Quantity requires exactly one non-staff resource type");
         var members = db.queryForList("""
@@ -131,6 +201,7 @@ public class PublicCatalogService {
         var now = Instant.now();
         var slots = new ArrayList<Map<String,Object>>();
         var seen = new HashSet<String>();
+        boolean skippedByTiming = false;
         for (var interval : intervals) {
             LocalTime from = asTime(interval.get("start_time"));
             LocalTime to = asTime(interval.get("end_time"));
@@ -144,30 +215,44 @@ public class PublicCatalogService {
                 Instant start = zdt.toInstant();
                 Instant end = start.plus(Duration.ofMinutes(duration));
                 if (!start.isAfter(now.plus(Duration.ofMinutes(notice))) ||
-                        start.isAfter(now.plus(Duration.ofDays(advance)))) continue;
+                        start.isAfter(now.plus(Duration.ofDays(advance)))) { skippedByTiming = true; continue; }
                 if (!custom && unavailable(orgId,locationId,null,start,end)) continue;
                 var freeMembers = new ArrayList<Long>();
                 for (var member : members) {
                     long mid = ((Number)member.get("id")).longValue();
                     if (memberFree(params,mid,time,time.plusMinutes(duration),start,end,before,after)) freeMembers.add(mid);
                 }
+                if (preferredMemberIds != null && !preferredMemberIds.isEmpty())
+                    freeMembers.removeIf(memberId -> !preferredMemberIds.contains(memberId));
                 if (requirements.isEmpty() && freeMembers.isEmpty()) continue;
+                if (staffCount == 0 && !requirements.isEmpty() && hasPreferredMember(preferredMemberIds)
+                        && freeMembers.isEmpty()) continue;
                 if (!requirements.isEmpty() && !custom && !resourcesFree(orgId,locationId,requirements,
-                        partySize,quantity,start.minus(Duration.ofMinutes(before)),end.plus(Duration.ofMinutes(after)),freeMembers)) continue;
+                        partySize,quantity,start.minus(Duration.ofMinutes(before)),end.plus(Duration.ofMinutes(after)),
+                        freeMembers,preferredResourceId)) continue;
                 if (seen.add(time.toString())) {
                     var slot = new LinkedHashMap<String,Object>();
                     slot.put("time",time.toString());
                     slot.put("startsAt",zdt.toOffsetDateTime().toString());
                     slot.put("memberIds",freeMembers);
+                    if (canChooseResource && !custom && !requirements.isEmpty())
+                        slot.put("resourceIds",availableResourceIds(orgId,locationId,requirements,partySize,quantity,
+                                start.minus(Duration.ofMinutes(before)),end.plus(Duration.ofMinutes(after)),
+                                preferredResourceId));
                     slots.add(slot);
                 }
-                if (slots.size()>=150) break;
+                if (slots.size()>=maxSlots) break;
             }
-            if (slots.size()>=150) break;
+            if (slots.size()>=maxSlots) break;
         }
+        String reason = !slots.isEmpty() ? "" : intervals.isEmpty() ? "closed" : skippedByTiming ? "timing" : "booked";
         return Map.of("date",date.toString(),"locationId",locationId,"serviceId",serviceId,
-                "durationMode",custom?"CUSTOM":"FIXED", "slots",slots,
+                "durationMode",custom?"CUSTOM":"FIXED", "slots",slots, "reason",reason,
                 "note",custom?"Return time and equipment availability are checked when booking is submitted":"Availability is rechecked when booking is submitted");
+    }
+
+    private static boolean hasPreferredMember(List<Long> ids) {
+        return ids != null && !ids.isEmpty();
     }
 
     private static LocalTime asTime(Object value) {
@@ -240,7 +325,7 @@ public class PublicCatalogService {
     }
 
     private boolean resourcesFree(long org,long loc,List<Map<String,Object>> requirements,Integer partySize,Integer quantity,
-                                  Instant from,Instant to,List<Long> freeMembers) {
+                                  Instant from,Instant to,List<Long> freeMembers,Long preferredResourceId) {
         for (var req:requirements) {
             String category = req.get("category").toString();
             if (partySize!=null && requirements.stream().noneMatch(r->"space".equals(r.get("category")))) return false;
@@ -248,12 +333,14 @@ public class PublicCatalogService {
             if ("space".equals(category) && partySize!=null) minCapacity=Math.max(minCapacity,partySize);
             var p = new MapSqlParameterSource().addValue("org",org).addValue("loc",loc)
                     .addValue("type",req.get("resource_type_id")).addValue("capacity",minCapacity)
+                    .addValue("preferred", "staff".equals(category) ? null : preferredResourceId)
                     .addValue("from",OffsetDateTime.ofInstant(from,ZoneOffset.UTC))
                     .addValue("to",OffsetDateTime.ofInstant(to,ZoneOffset.UTC));
             var available = db.queryForList("""
                     SELECT r.member_id FROM resources r
                     WHERE r.organization_id=:org AND r.location_id=:loc AND r.resource_type_id=:type
                       AND r.active AND r.resource_state='available' AND r.capacity>=:capacity
+                      AND (CAST(:preferred AS bigint) IS NULL OR r.id=:preferred)
                       AND NOT EXISTS(SELECT 1 FROM reservation_resources rr
                         WHERE rr.resource_id=r.id AND rr.active
                           AND rr.occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)'))
@@ -265,5 +352,34 @@ public class PublicCatalogService {
             if (count < required) return false;
         }
         return true;
+    }
+
+    private List<Long> availableResourceIds(long org,long loc,List<Map<String,Object>> requirements,
+                                             Integer partySize,Integer quantity,Instant from,Instant to,
+                                             Long preferredResourceId) {
+        var requirement = requirements.stream().filter(r -> !"staff".equals(r.get("category")))
+                .findFirst().orElseThrow();
+        int minCapacity = requirement.get("min_capacity") == null ? 1
+                : ((Number) requirement.get("min_capacity")).intValue();
+        if ("space".equals(requirement.get("category")) && partySize != null)
+            minCapacity = Math.max(minCapacity, partySize);
+        var params = new MapSqlParameterSource().addValue("org",org).addValue("loc",loc)
+                .addValue("type",requirement.get("resource_type_id")).addValue("capacity",minCapacity)
+                .addValue("from",OffsetDateTime.ofInstant(from,ZoneOffset.UTC))
+                .addValue("to",OffsetDateTime.ofInstant(to,ZoneOffset.UTC))
+                .addValue("preferred",preferredResourceId);
+        int required = ((Number) requirement.get("quantity")).intValue();
+        if (quantity != null) required = quantity;
+        if (required != 1) return List.of();
+        return db.queryForList("""
+                SELECT r.id FROM resources r
+                WHERE r.organization_id=:org AND r.location_id=:loc AND r.resource_type_id=:type
+                  AND r.active AND r.resource_state='available' AND r.capacity>=:capacity
+                  AND (CAST(:preferred AS bigint) IS NULL OR r.id=:preferred)
+                  AND NOT EXISTS(SELECT 1 FROM reservation_resources rr
+                    WHERE rr.resource_id=r.id AND rr.active
+                      AND rr.occupied_period && tstzrange(CAST(:from AS timestamptz),CAST(:to AS timestamptz),'[)'))
+                ORDER BY r.capacity,r.id
+                """,params).stream().map(row -> ((Number) row.get("id")).longValue()).toList();
     }
 }

@@ -165,6 +165,8 @@ public class OrganizationSecurity {
         if (userId == null || !canRead(organizationId, authentication)) return false;
         Integer count = db.queryForObject("""
                 SELECT count(*) FROM reservation_items ri
+                JOIN reservations r ON r.organization_id=ri.organization_id
+                  AND r.id=ri.reservation_id
                 WHERE ri.organization_id=:org AND ri.reservation_id=:reservation AND (
                   EXISTS (SELECT 1 FROM organization_members m
                           WHERE m.organization_id=ri.organization_id AND m.id=ri.member_id
@@ -175,6 +177,7 @@ public class OrganizationSecurity {
                              JOIN organization_members m ON m.organization_id=res.organization_id
                                                         AND m.id=res.member_id
                              WHERE rr.organization_id=ri.organization_id AND rr.reservation_item_id=ri.id
+                               AND (rr.active OR r.status='cancelled')
                                AND m.user_id=:user AND m.active=true)
                 )
                 """, Map.of("org", organizationId, "reservation", reservationId, "user", userId), Integer.class);

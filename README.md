@@ -8,6 +8,14 @@ A runnable **starter backend** for the agreed multi-tenant reservation model. Th
 
 ## Run
 
+Location archiving and deactivation are blocked while pending/confirmed bookings
+or confirmed event registrations have not ended. Opening-hour and date-override
+changes are transactional: conflicting pending/confirmed bookings, including
+ongoing bookings, cause HTTP 409 and roll back the schedule change.
+`dryRun=true` previews conflicts without saving. The legacy
+`cancelConflictingReservations` parameter does not bypass this protection;
+affected bookings must be moved or cancelled manually first.
+
 Prerequisites: Java 21, Maven 3.9+, Docker.
 
 ```bash
@@ -17,7 +25,7 @@ mvn spring-boot:run
 
 When running locally, Spring loads the ignored `bookanear-api/.env.local` file. It contains the local configuration defaults and must be updated with valid database and SMTP settings. Docker Compose uses `.env` instead. Flyway applies pending migrations at startup. Health: `GET http://localhost:8080/actuator/health`.
 
-The optional in-app help assistant uses the OpenAI API. Set `OPENAI_API_KEY` in `.env.local` for local runs or `.env` for Docker Compose; `OPENAI_MODEL` defaults to `gpt-4o-mini`. Keep the key server-side and out of source control. The assistant sends chat messages to OpenAI, does not receive organization data, and is restricted by its instructions to Bookanear usage help.
+The optional in-app help assistant uses any OpenAI-compatible chat API (`AI_HELP_BASE_URL`, default OpenAI; free options: Google Gemini `https://generativelanguage.googleapis.com/v1beta/openai` with `gemini-2.0-flash`, or Groq `https://api.groq.com/openai/v1` with `llama-3.3-70b-versatile`). Set `AI_HELP_API_KEY` in `.env.local` for local runs or `.env` for Docker Compose; `AI_HELP_MODEL` defaults to `gpt-4o-mini` (the older `OPENAI_API_KEY` / `OPENAI_MODEL` names still work as fallbacks). Keep the key server-side and out of source control. The assistant sends chat messages to the configured provider, does not receive organization data, and is restricted by its instructions to Bookanear usage help. Its verified product guide is `src/main/resources/ai-help/product-guide.md`; Maven packages the current guide into every API build. Update this guide when product behavior changes, then rebuild and redeploy the API. A build packages the guide but does not infer new behavior from source code automatically. The assistant stores up to the latest 200 chat messages per authenticated user in PostgreSQL. Users can restore this history when reopening the assistant or signing in again, and delete it through the assistant's trash button. Migration `V22__ai_help_conversation_history.sql` creates the history table; messages are deleted automatically when the account is deleted.
 
 To empty all application tables without removing the schema or Flyway migration history, open `scripts/clean-database.sql` in DBeaver, replace `REPLACE_WITH_DATABASE_NAME` with the exact target database name shown in DBeaver, then execute the script. It refuses to run if the placeholder was not changed or the active connection is to a different database:
 

@@ -194,7 +194,8 @@ public class SetupService {
                 .addValue("language",preferredLanguage(options.defaultPublicLanguage()))
                 .addValue("currency",preferredCurrency(options.defaultCurrency()))
                 .addValue("dateFormat",dateFormat(options.dateFormat()))
-                .addValue("advanceDays",options.maxAdvanceDays(),java.sql.Types.INTEGER);
+                .addValue("advanceDays",options.maxAdvanceDays(),java.sql.Types.INTEGER)
+                .addValue("weekStartsOn",options.weekStartsOn(),java.sql.Types.INTEGER);
         db.update("""
             UPDATE organization_booking_config SET settings=settings || jsonb_build_object(
               'customerSelectResource',CAST(:select AS boolean),
@@ -203,7 +204,8 @@ public class SetupService {
               'defaultPublicLanguage',CAST(:language AS text),
               'defaultCurrency',CAST(:currency AS text),
               'dateFormat',CAST(:dateFormat AS text),
-              'maxAdvanceDays',CAST(COALESCE(:advanceDays,COALESCE((settings->>'maxAdvanceDays')::integer,180)) AS integer)),updated_at=now()
+              'maxAdvanceDays',CAST(COALESCE(:advanceDays,COALESCE((settings->>'maxAdvanceDays')::integer,180)) AS integer),
+              'weekStartsOn',CAST(COALESCE(:weekStartsOn,COALESCE((settings->>'weekStartsOn')::integer,1)) AS integer)),updated_at=now()
             WHERE organization_id=:org
             """,settingArgs);
         if (options.trackResources() != null) {
